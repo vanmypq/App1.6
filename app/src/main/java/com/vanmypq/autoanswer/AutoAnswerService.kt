@@ -18,7 +18,6 @@ import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.TextView
 import android.widget.Toast
 import com.google.mlkit.vision.common.InputImage
@@ -36,15 +35,6 @@ class AutoAnswerService : AccessibilityService() {
         val checked: Boolean = false,
         val input: Boolean = false
     )
-
-    // Kết quả quét các nút điều hướng trên màn hình hiện tại.
-    class Nav {
-        var confirm: AccessibilityNodeInfo? = null
-        var next: AccessibilityNodeInfo? = null
-        var finish: AccessibilityNodeInfo? = null
-        var scroller: AccessibilityNodeInfo? = null
-        var scrollRect: Rect? = null
-    }
 
     // Một hành động: chạm vào đáp án (text == null) hoặc gõ chữ vào ô nhập (text != null).
     data class Act(val item: Item, val occ: Int, val text: String? = null)
@@ -67,13 +57,6 @@ class AutoAnswerService : AccessibilityService() {
     private var tapping = false
     private var tapStart = 0L
     private var staleCount = 0
-    private var advanceNotBefore = 0L
-    private var bottomHash = 0
-    private var confirmedHash = 0
-    private var lastNextHash = 0
-    private var nextRepeat = 0
-    private var stuck = 0
-    private var actions = 0
     private val clockRe = Regex("\\d{1,2}:\\d{2}(:\\d{2})?")
 
     private val idleTicker = object : Runnable {
@@ -134,13 +117,6 @@ class AutoAnswerService : AccessibilityService() {
         cooldownUntil = 0L
         tapping = false
         staleCount = 0
-        advanceNotBefore = 0L
-        bottomHash = 0
-        confirmedHash = 0
-        lastNextHash = 0
-        nextRepeat = 0
-        stuck = 0
-        actions = 0
         status = if (auto) "đang quét" else ""
         refresh()
         handler.removeCallbacks(loop)
@@ -198,9 +174,18 @@ class AutoAnswerService : AccessibilityService() {
         return n.isCheckable || cn.contains("RadioButton") || cn.contains("CheckBox") || cn.contains("CheckedTextView")
     }
 
+    // Icon trang trí (ghim, sao, menu, chia sẻ...) không phải đáp án: loại khỏi danh sách ô tích chọn
+    // để khỏi bị gắn nhầm thành đáp án và làm AI rối, không nhận ra câu hỏi.
+    private val decorIconRe = Regex(
+        "(?i)ghim|pin|bookmark|đánh dấu|yêu thích|favorite|star|sao|cờ|flag|chia sẻ|share|" +
+            "sao chép|copy|menu|cài đặt|setting|tìm kiếm|search|quay lại|back|đóng|close|thêm|add|xóa|delete|more"
+    )
+
     // Nút tròn/ô vuông tự vẽ (ImageView bấm được, không có chữ) dùng làm ô tích chọn.
     private fun looksLikeIconButton(n: AccessibilityNodeInfo, r: Rect): Boolean {
         if (!n.isClickable || !n.isEnabled || n.childCount != 0) return false
+        val desc = n.contentDescription?.toString() ?: ""
+        if (desc.isNotEmpty() && decorIconRe.containsMatchIn(desc)) return false
         val d = resources.displayMetrics.density
         val w = r.width()
         val h = r.height()
@@ -291,8 +276,8 @@ class AutoAnswerService : AccessibilityService() {
     private fun process(items: List<Item>, key: String) {
         if (items.isEmpty()) return
         val h = sig(items)
-        if (h != currentHash) { currentHash = h; retries = 0; stuck = 0 }
-        if (h == lastHash) { maybeAdvance(items, h); return }
+        if (h != currentHash) { currentHash = h; retries = 0 }
+        if (h == lastHash) return
         val lh = layoutOf(items)
         if (lh != layoutHash) {
             layoutHash = lh
@@ -378,14 +363,13 @@ class AutoAnswerService : AccessibilityService() {
                         answerCache[h] = acts.map { p -> Pair(p.item.text, p.occ) }
                     }
                     chooseAll(acts, 0)
-                } else if (retries < 1 && !items.any { it.checked }) {
+                } else if (retries < 1) {
                     retries++
                     lastHash = 0
                     status = "thử lại ($retries)"
                     refresh()
                 } else {
                     status = "không thấy câu hỏi"
-                    advanceNotBefore = SystemClock.uptimeMillis() + 400
                     refresh()
                 }
             }
@@ -417,17 +401,7 @@ class AutoAnswerService : AccessibilityService() {
             } else {
                 flush()
                 if (item.ctrl) sb.append("[${i + 1}] ").append(if (item.checked) "☑ " else "☐ ").append(t).append('\n')
-                else if (item.input) {
-                    val filled = item.node?.let { nd ->
-                        nd.refresh()
-                        if (nd.isShowingHintText) "" else (nd.text?.toString()?.trim() ?: "")
-                    } ?: ""
-                    sb.append("[${i + 1}] ✎ ").append(t)
-                    if (filled.isNotEmpty()) sb.append(" (đã điền: ").append(filled.take(40)).append(')')
-                    val above = nearestAbove(items, i)
-                    if (above.isNotEmpty()) sb.append(" (ô của dòng: ").append(above).append(')')
-                    sb.append('\n')
-                }
+                else if (item.input) sb.append("[${i + 1}] ✎ ").append(t).append('\n')
                 else sb.append("[${i + 1}] ").append(t).append('\n')
             }
         }
@@ -456,58 +430,18 @@ class AutoAnswerService : AccessibilityService() {
         return item
     }
 
-    // Gõ chữ vào ô nhập: SET_TEXT trước, nếu app/web không nhận thì chọn hết rồi dán qua clipboard.
+    // Gõ chữ vào ô nhập: SET_TEXT trước, nếu app/web không nhận thì dán qua clipboard.
     private fun typeInto(n: AccessibilityNodeInfo?, text: String): Boolean {
         if (n == null) return false
         n.refresh()
         n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         val args = Bundle()
         args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
-        if (n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
-            n.refresh()
-            val now = if (n.isShowingHintText) "" else (n.text?.toString()?.trim() ?: "")
-            // Rỗng/không đọc lại được thì tin kết quả của SET_TEXT; chỉ dán lại khi chắc chắn đang là chữ khác.
-            if (now.isEmpty() || now == text || now.contains(text)) return true
-        }
+        if (n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
         val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
         cm.setPrimaryClip(android.content.ClipData.newPlainText("ans", text))
         n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        val sel = Bundle()
-        sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
-        sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, if (n.isShowingHintText) 0 else (n.text?.length ?: 0))
-        n.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, sel)
         return n.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-    }
-
-    // Nhập CHÍNH XÁC vào đúng ô: đưa ô vào màn hình, chạm thật vào giữa ô để lấy focus, rồi chỉ gõ vào ô đang focus
-    // (nếu ô đó trùng vùng với ô đã chọn). Ô đã có đúng đáp án thì bỏ qua.
-    private fun typeAt(cur: Item, text: String, done: (Boolean) -> Unit) {
-        val n = cur.node
-        if (n == null) { done(false); return }
-        n.refresh()
-        val existing = if (n.isShowingHintText) "" else (n.text?.toString()?.trim() ?: "")
-        if (existing.isNotEmpty() && existing.equals(text.trim(), ignoreCase = true)) { done(true); return }
-        n.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
-        handler.postDelayed({
-            n.refresh()
-            val r = Rect(); n.getBoundsInScreen(r)
-            val canTap = !r.isEmpty && n.isVisibleToUser && r.exactCenterY() < imeTop() - 4
-            val afterFocus = {
-                handler.postDelayed({
-                    n.refresh()
-                    var target: AccessibilityNodeInfo = n
-                    if (!n.isFocused) {
-                        val f = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                        if (f != null && (f.isEditable || (f.className?.toString() ?: "").contains("EditText"))) {
-                            val fr = Rect(); f.getBoundsInScreen(fr)
-                            if (Rect.intersects(fr, r)) target = f
-                        }
-                    }
-                    done(typeInto(target, text))
-                }, 220)
-            }
-            if (canTap) tap(r) { afterFocus() } else afterFocus()
-        }, 120)
     }
 
     // Thực hiện lần lượt các hành động (chạm đáp án / gõ chữ). Bỏ qua ô đã được tích để khỏi bị bỏ tích.
@@ -534,10 +468,8 @@ class AutoAnswerService : AccessibilityService() {
         val cur = resolve(act.item, act.occ)
         val next = { handler.postDelayed({ chooseAll(acts, index + 1) }, 30) }
         if (act.text != null) {
-            typeAt(cur, act.text) { ok ->
-                if (!ok) toast("Không gõ được vào ô nhập (ứng dụng chặn)")
-                next()
-            }
+            if (!typeInto(cur.node, act.text)) toast("Không gõ được vào ô nhập (ứng dụng chặn)")
+            next()
             return
         }
         val n = cur.node
@@ -564,7 +496,6 @@ class AutoAnswerService : AccessibilityService() {
             lastHash = h2
             currentHash = h2
             layoutHash = layoutOf(items2)
-            advanceNotBefore = SystemClock.uptimeMillis() + 700
         }, 250)
     }
 
@@ -597,238 +528,6 @@ class AutoAnswerService : AccessibilityService() {
             override fun onCancelled(gestureDescription: GestureDescription?) { onDone(false) }
         }, handler)
         if (!ok) onDone(false)
-    }
-
-    // Dòng chữ gần nhất phía trên ô nhập, để AI biết ô nào thuộc câu nào.
-    private fun nearestAbove(items: List<Item>, i: Int): String {
-        val top = items[i].rect.top
-        for (j in i - 1 downTo 0) {
-            val o = items[j]
-            if (o.ctrl || o.input || o.text.length < 6 || o.text.startsWith("(")) continue
-            if (o.rect.bottom <= top + 20) return o.text.take(60)
-        }
-        return ""
-    }
-
-    // ===================== TỰ CUỘN / TỰ CHUYỂN CÂU =====================
-    private val finishWords = listOf("nộp bài", "kết thúc", "hoàn thành", "hoàn tất", "submit", "finish", "gửi bài", "xem kết quả", "nộp")
-    private val backWords = listOf("trước", "quay lại", "back", "previous", "prev")
-    private val nextPrefix = listOf("câu tiếp", "tiếp theo", "tiếp tục", "next", "câu sau", "câu kế", "kế tiếp", "sang câu", "chuyển câu", "continue")
-    private val nextExact = setOf("tiếp", "sau", "›", "»", "→", ">", ">>", "❯", "▶")
-    private val confirmExact = setOf("kiểm tra", "kiểm tra đáp án", "kiểm tra câu trả lời", "check", "check answer", "trả lời", "gửi đáp án", "chốt đáp án", "xác nhận đáp án")
-    private val resultWords = listOf("chính xác", "chưa đúng", "đáp án đúng", "đúng rồi", "sai rồi", "correct", "incorrect")
-
-    // 1 = nút chuyển câu, 2 = nút kiểm tra/gửi đáp án của câu, 3 = nút nộp bài/kết thúc (không tự bấm), 0 = khác.
-    private fun classify(lab: String, id: String): Int {
-        if (lab.isNotEmpty() && lab.length <= 28) {
-            if (finishWords.any { lab.contains(it) }) return 3
-            if (backWords.any { lab.contains(it) }) return 0
-            if (lab in nextExact || nextPrefix.any { lab.startsWith(it) } ||
-                lab.endsWith(" →") || lab.endsWith(" ›") || lab.endsWith(" »")) return 1
-            if (lab in confirmExact) return 2
-        }
-        if (id.contains("next") && !id.contains("prev") && !id.contains("text")) return 1
-        return 0
-    }
-
-    private fun clickableChain(n: AccessibilityNodeInfo): Boolean {
-        var c: AccessibilityNodeInfo? = n
-        var d = 0
-        while (c != null && d < 4) {
-            if (c.isClickable) return true
-            c = c.parent
-            d++
-        }
-        return false
-    }
-
-    private fun scanNav(root: AccessibilityNodeInfo): Nav {
-        val nav = Nav()
-        val dm = resources.displayMetrics
-        var bestArea = 0L
-        var nextBottom = -1
-        var confBottom = -1
-        var finBottom = -1
-        fun walk(n: AccessibilityNodeInfo, depth: Int) {
-            if (depth > 40 || !n.isVisibleToUser) return
-            val r = Rect(); n.getBoundsInScreen(r)
-            if (n.isScrollable && r.height() >= 0.3f * dm.heightPixels && r.width() >= 0.5f * dm.widthPixels &&
-                n.actionList.contains(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD)) {
-                val area = r.width().toLong() * r.height()
-                if (area > bestArea) { bestArea = area; nav.scroller = n; nav.scrollRect = Rect(r) }
-            }
-            if (n.isEnabled && r.height() > 0 && r.width() > 0 && r.height() < 0.25f * dm.heightPixels && !isChoiceNode(n)) {
-                val raw = (n.text ?: n.contentDescription)?.toString() ?: ""
-                val lab = raw.trim().lowercase().replace(Regex("[\\s.!:]+"), " ").trim()
-                val kind = classify(lab, n.viewIdResourceName?.lowercase() ?: "")
-                if (kind != 0 && clickableChain(n)) {
-                    when (kind) {
-                        1 -> if (r.bottom > nextBottom) { nextBottom = r.bottom; nav.next = n }
-                        2 -> if (r.bottom > confBottom) { confBottom = r.bottom; nav.confirm = n }
-                        3 -> if (r.bottom > finBottom) { finBottom = r.bottom; nav.finish = n }
-                    }
-                }
-            }
-            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1) }
-        }
-        walk(root, 0)
-        return nav
-    }
-
-    private fun imeTop(): Int {
-        try {
-            for (w in windows) {
-                if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
-                    val r = Rect(); w.getBoundsInScreen(r)
-                    if (!r.isEmpty) return r.top
-                }
-            }
-        } catch (e: Exception) {
-        }
-        return Int.MAX_VALUE
-    }
-
-    private fun swipe(x: Float, y1: Float, y2: Float, dur: Long, onDone: (Boolean) -> Unit) {
-        val p = Path().apply { moveTo(x, y1); lineTo(x, y2) }
-        val g = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, dur)).build()
-        val ok = dispatchGesture(g, object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) { onDone(true) }
-            override fun onCancelled(gestureDescription: GestureDescription?) { onDone(false) }
-        }, handler)
-        if (!ok) onDone(false)
-    }
-
-    private fun clickButton(n: AccessibilityNodeInfo, done: () -> Unit) {
-        n.refresh()
-        var cur: AccessibilityNodeInfo? = n
-        var d = 0
-        while (cur != null && d < 5) {
-            if (cur.isClickable && cur.isEnabled && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) { done(); return }
-            cur = cur.parent
-            d++
-        }
-        val r = Rect(); n.getBoundsInScreen(r)
-        if (r.isEmpty) { done(); return }
-        tap(r) { done() }
-    }
-
-    private fun endAction(wait: Long) {
-        tapping = false
-        val t = SystemClock.uptimeMillis() + wait
-        cooldownUntil = t
-        advanceNotBefore = t
-    }
-
-    private fun stopAuto(msg: String) {
-        auto = false
-        tapping = false
-        handler.removeCallbacks(loop)
-        status = ""
-        refresh()
-        toast(msg)
-    }
-
-    // Màn hình đã xử lý xong: lần lượt kiểm tra đáp án -> cuộn tìm câu mới -> bấm chuyển câu. Không bao giờ tự nộp bài.
-    private fun maybeAdvance(items: List<Item>, h: Int) {
-        if (!getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("advance", true)) return
-        val now = SystemClock.uptimeMillis()
-        if (busy || tapping || now < advanceNotBefore || now < cooldownUntil) return
-        val lh = layoutOf(items)
-        if (lh != layoutHash) { layoutHash = lh; advanceNotBefore = now + 400; return }
-        val root = rootInActiveWindow ?: return
-        val nav = scanNav(root)
-
-        // 1) Nút "Kiểm tra / Trả lời" của câu (chỉ bấm 1 lần cho mỗi màn hình).
-        val conf = nav.confirm
-        if (conf != null && confirmedHash != h) {
-            confirmedHash = h
-            actions++
-            tapping = true; tapStart = now
-            status = "kiểm tra đáp án"; refresh()
-            clickButton(conf) {
-                handler.postDelayed({
-                    val it2 = collect()
-                    val joined = it2.joinToString(" ") { x -> x.text }.lowercase()
-                    if (resultWords.any { w -> joined.contains(w) }) {
-                        val h2 = sig(it2)
-                        lastHash = h2; currentHash = h2; confirmedHash = h2; layoutHash = layoutOf(it2)
-                    }
-                    endAction(500)
-                }, 700)
-            }
-            return
-        }
-
-        // 2) Cuộn xuống tìm câu mới (nếu trang còn cuộn được, hoặc không có nút chuyển câu để dùng).
-        val atBottom = bottomHash == h
-        if (!atBottom && (nav.scroller != null || nav.next == null)) {
-            actions++
-            if (actions > 400) { stopAuto("Đã chạy 400 bước, tự dừng cho an toàn"); return }
-            scrollPage(nav, h)
-            return
-        }
-
-        // 3) Bấm nút chuyển câu.
-        val nx = nav.next
-        if (nx != null) {
-            if (h == lastNextHash) nextRepeat++ else { nextRepeat = 0; lastNextHash = h }
-            if (nextRepeat == 1) {
-                // Bấm rồi mà màn hình không đổi: có thể chưa chọn xong đáp án, hỏi lại AI một lần.
-                answerCache.remove(h)
-                lastHash = 0; layoutHash = 0; retries = 0
-                advanceNotBefore = now + 800
-                status = "chưa chuyển được, kiểm tra lại"; refresh()
-                return
-            }
-            if (nextRepeat >= 3) {
-                stopAuto("Bấm nút chuyển câu nhưng màn hình không đổi. Có thể câu này chưa chọn được đáp án hoặc đã hết bài.")
-                return
-            }
-            actions++
-            if (actions > 400) { stopAuto("Đã chạy 400 bước, tự dừng cho an toàn"); return }
-            tapping = true; tapStart = now
-            status = "chuyển câu"; refresh()
-            clickButton(nx) { handler.postDelayed({ endAction(600) }, 300) }
-            return
-        }
-
-        // 4) Hết trang và không có nút chuyển câu: nếu có nút Nộp bài thì dừng để người dùng tự bấm.
-        if (nav.finish != null) {
-            stopAuto("Đã làm hết câu. Hãy tự kiểm tra rồi tự bấm Nộp bài.")
-            return
-        }
-        stuck++
-        advanceNotBefore = now + 1500
-        if (stuck >= 3) stopAuto("Không thấy thêm câu hỏi hoặc nút chuyển câu, đã dừng.")
-    }
-
-    // Vuốt lên để cuộn (có chồng lấn ~50% để không lỡ câu nằm giữa 2 màn hình); nếu không đổi thì thử ACTION_SCROLL_FORWARD;
-    // nếu vẫn không đổi coi như đã tới cuối trang.
-    private fun scrollPage(nav: Nav, h: Int) {
-        tapping = true
-        tapStart = SystemClock.uptimeMillis()
-        status = "cuộn tìm câu mới"; refresh()
-        val before = layoutOf(collect())
-        val dm = resources.displayMetrics
-        val sr = nav.scrollRect
-        val top = (sr?.top ?: (dm.heightPixels * 0.15f).toInt())
-        var bot = minOf(sr?.bottom ?: dm.heightPixels, imeTop())
-        bot = minOf(bot, dm.heightPixels - (dm.heightPixels * 0.06f).toInt())
-        val hgt = (bot - top).coerceAtLeast(200)
-        val x = (sr?.exactCenterX() ?: (dm.widthPixels / 2f)).coerceIn(10f, dm.widthPixels - 10f)
-        swipe(x, top + hgt * 0.78f, top + hgt * 0.28f, 450) {
-            handler.postDelayed({
-                val after = layoutOf(collect())
-                if (after != before) {
-                    endAction(700)
-                } else {
-                    nav.scroller?.let { sc -> sc.refresh(); sc.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) }
-                    handler.postDelayed({
-                        if (layoutOf(collect()) == before) { bottomHash = h; endAction(200) } else endAction(700)
-                    }, 600)
-                }
-            }, 700)
-        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
