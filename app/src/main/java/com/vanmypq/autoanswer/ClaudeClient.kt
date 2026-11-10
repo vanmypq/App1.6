@@ -30,7 +30,10 @@ object ClaudeClient {
         "cùng hàng. Hỗ trợ MỌI dạng: đáp án có chữ A/B/C/D; chỉ có ô tròn/ô vuông không có chữ cái (không cần tự " +
         "thêm chữ A/B/C/D nếu đề không ghi); câu hỏi có thể được đóng khung bằng tiêu đề đánh số như '8. Chọn đáp " +
         "án đúng nhất' thay vì ghi 'Câu 8', các phương án nằm ngay sau nội dung câu hỏi đó cho tới tiêu đề câu kế " +
-        "tiếp; nhiều câu hỏi CHƯA trả lời có thể hiện cùng lúc trên một màn hình (trả lời tất cả); một đáp án " +
+        "tiếp; nhiều câu hỏi CHƯA trả lời có thể hiện cùng lúc trên một màn hình (trả lời tất cả); dòng '---' là " +
+        "vạch phân cách GIỮA HAI CÂU HỎI KHÁC NHAU, không thuộc về câu nào; dòng '(cần xem ảnh để biết Đúng/Sai " +
+        "nào đang được chọn)' nghĩa là các nút 'Đúng'/'Sai' không tự hiển thị dấu đã chọn trong văn bản, hãy nhìn " +
+        "ẢNH CHỤP để biết ý nào đã chọn trước khi quyết định bấm ý nào; một đáp án " +
         "đúng; nhiều đáp án đúng; dạng Đúng/Sai theo từng ý a,b,c,d (chọn nút Đúng hoặc Sai của MỖI ý); và nhiều " +
         "câu hỏi cùng lúc trên một màn hình (trả lời tất cả). Với câu PHỦ ĐỊNH (KHÔNG PHẢI, SAI, NGOẠI TRỪ) chọn " +
         "phương án KHÔNG thỏa điều kiện. Dù là câu lý thuyết/khái niệm không có phép tính, VẪN PHẢI chọn phương " +
@@ -239,7 +242,7 @@ object ClaudeClient {
             Regex("(?i)tính|giải|giá trị|rút gọn|phương trình|bằng bao nhiêu|diện tích|chu vi|thể tích").containsMatchIn(screenText)
         val search = hasInput && !mathy
         // Chế độ nhanh chỉ gửi ảnh khi có công thức; chế độ chính xác luôn gửi ảnh.
-        val needImg = !fast || screenText.contains("(công thức)")
+        val needImg = !fast || screenText.contains("(công thức)") || screenText.contains("(cần xem ảnh")
         val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1000 else 0) } catch (e: Exception) { null }) else null
         val base = models ?: DEFAULT_MODELS
         // Cả hai chế độ đều ưu tiên Flash đầy đủ (Lite hay đoán sai bài toán); Lite chỉ là dự phòng khi lỗi/hết hạn mức.
