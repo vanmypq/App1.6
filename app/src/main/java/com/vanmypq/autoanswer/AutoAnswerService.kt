@@ -10,6 +10,7 @@ import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import org.json.JSONArray
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -33,7 +34,8 @@ class AutoAnswerService : AccessibilityService() {
         val node: AccessibilityNodeInfo?,
         val ctrl: Boolean = false,
         val checked: Boolean = false,
-        val input: Boolean = false
+        val input: Boolean = false,
+        val maxLen: Int = 0
     )
 
     // Một hành động: chạm vào đáp án (text == null) hoặc gõ chữ vào ô nhập (text != null).
@@ -54,6 +56,29 @@ class AutoAnswerService : AccessibilityService() {
     private var warnedNoOcr = false
     private var lastSent = ""
     private val answerCache = HashMap<Int, List<Pair<String, Int>>>()
+    private val slowHashes = HashSet<Int>()
+
+    // Nhớ đáp án lâu dài trên máy (còn sau khi đóng app), để lần ôn lại cùng đề không cần hỏi AI nữa.
+    private fun cachePrefs() = getSharedPreferences("answer-cache", MODE_PRIVATE)
+
+    private fun loadCache(h: Int): List<Pair<String, Int>>? {
+        val raw = cachePrefs().getString(h.toString(), null) ?: return null
+        return try {
+            val ja = JSONArray(raw)
+            (0 until ja.length()).map { i ->
+                val o = ja.getJSONObject(i)
+                Pair(o.getString("t"), o.getInt("o"))
+            }
+        } catch (e: Exception) { null }
+    }
+
+    private fun saveCache(h: Int, list: List<Pair<String, Int>>) {
+        val ja = JSONArray()
+        for ((t, o) in list) ja.put(org.json.JSONObject().put("t", t).put("o", o))
+        val p = cachePrefs()
+        if (p.all.size > 500) p.edit().clear().apply()  // tránh phình to vô hạn qua nhiều đề khác nhau
+        p.edit().putString(h.toString(), ja.toString()).apply()
+    }
     private var tapping = false
     private var tapStart = 0L
     private var staleCount = 0
@@ -117,6 +142,7 @@ class AutoAnswerService : AccessibilityService() {
         cooldownUntil = 0L
         tapping = false
         staleCount = 0
+        slowHashes.clear()
         status = if (auto) "đang quét" else ""
         refresh()
         handler.removeCallbacks(loop)
@@ -248,7 +274,31 @@ class AutoAnswerService : AccessibilityService() {
             }
         }
         walk(root, 0, false, Rect())
-        return labelControls(out)
+        return attachInputLimits(labelControls(out))
+    }
+
+    // Tìm số đếm ký tự kiểu "0/100" nằm cùng hàng với ô nhập, để TỰ CẮT chữ đúng giới hạn
+    // thay vì chỉ trông chờ AI tuân thủ theo lời dặn trong prompt.
+    private val limitRe = Regex("^\\s*\\d+\\s*/\\s*(\\d+)\\s*$")
+
+    private fun attachInputLimits(list: List<Item>): List<Item> {
+        val out = ArrayList(list)
+        for (i in out.indices) {
+            val it = out[i]
+            if (!it.input) continue
+            var found = 0
+            for (o in out) {
+                if (o === it || o.input || o.ctrl) continue
+                val m = limitRe.find(o.text) ?: continue
+                val top = maxOf(o.rect.top, it.rect.top)
+                val bot = minOf(o.rect.bottom, it.rect.bottom)
+                if ((bot - top) < 0.3f * minOf(o.rect.height(), it.rect.height())) continue
+                found = m.groupValues[1].toIntOrNull() ?: 0
+                if (found > 0) break
+            }
+            if (found > 0) out[i] = it.copy(maxLen = found)
+        }
+        return out
     }
 
     @TargetApi(30)
@@ -284,7 +334,7 @@ class AutoAnswerService : AccessibilityService() {
             setStatus("chờ trang ổn định…")
             return
         }
-        val cached = answerCache[h]
+        val cached = answerCache[h] ?: loadCache(h)?.also { answerCache[h] = it }
         if (cached != null) {
             val targets = ArrayList<Pair<Item, Int>>()
             for ((txt, occ) in cached) {
@@ -301,7 +351,7 @@ class AutoAnswerService : AccessibilityService() {
         }
         val hasImg = CaptureService.isRunning()
         val text = buildPrompt(items)
-        if (!hasImg && text.contains("(công thức)")) {
+        if (!hasImg && (text.contains("(công thức)") || text.contains("(cần xem ảnh"))) {
             status = "⚠ CHƯA BẬT CHỤP MÀN HÌNH: mở app Auto Trắc Nghiệm > Cấp quyền chụp màn hình"
             refresh()
             cooldownUntil = SystemClock.uptimeMillis() + 3000
@@ -316,8 +366,9 @@ class AutoAnswerService : AccessibilityService() {
         exec.execute {
             var got = ClaudeClient.Answer(emptyList(), emptyMap())
             var gotErr: String? = null
+            val effFast = fast && !slowHashes.contains(h)
             try {
-                got = ClaudeClient.ask(key, text, fast, hasInput)
+                got = ClaudeClient.ask(key, text, effFast, hasInput)
             } catch (e: Exception) {
                 gotErr = e.message ?: "lỗi mạng"
             }
@@ -359,16 +410,23 @@ class AutoAnswerService : AccessibilityService() {
                     status = if (typed.isNotEmpty()) "nhập: " + typed.values.first().take(25)
                              else "chọn ${valid.size}: " + items[valid[0] - 1].text.take(25)
                     refresh()
+                    slowHashes.remove(h)
                     if (!hasInput && (hasImg || !text.contains("(công thức)"))) {
-                        answerCache[h] = acts.map { p -> Pair(p.item.text, p.occ) }
+                        val list = acts.map { p -> Pair(p.item.text, p.occ) }
+                        answerCache[h] = list
+                        saveCache(h, list)
                     }
                     chooseAll(acts, 0)
                 } else if (retries < 1) {
                     retries++
                     lastHash = 0
-                    status = "thử lại ($retries)"
+                    // Nhanh không ra kết quả: lần sau TỰ chuyển sang chế độ chính xác (có ảnh, suy nghĩ kỹ)
+                    // cho đúng câu này, thay vì lặp lại y hệt lần thử trước.
+                    if (effFast) slowHashes.add(h)
+                    status = "thử lại, chế độ chính xác ($retries)"
                     refresh()
                 } else {
+                    slowHashes.remove(h)
                     status = "không thấy câu hỏi"
                     refresh()
                 }
@@ -378,9 +436,15 @@ class AutoAnswerService : AccessibilityService() {
 
     // Ghép các mảnh công thức rời rạc (mỗi ký tự một nút) thành một dòng "(công thức)" cho AI dễ đọc.
     // Ô tích chọn được đánh dấu ☐ (chưa chọn) / ☑ (đã chọn). Số thứ tự gốc được giữ để AI trả đúng số cần chạm.
+    // Câu đánh số kiểu "Câu 8" / "8." mở đầu một câu hỏi mới: chèn vạch phân cách để AI không
+    // lẫn phương án của câu này sang câu khác khi nhiều câu hiện cùng lúc trên một màn hình.
+    private val headerRe = Regex("(?i)^(câu\\s*\\d+\\b|\\d{1,3}[.)])")
+
     private fun buildPrompt(items: List<Item>): String {
         val sb = StringBuilder()
         val run = ArrayList<Int>()
+        val hasPlainTrueFalse = items.any { !it.ctrl && (it.text.trim() == "Đúng" || it.text.trim() == "Sai") }
+        if (hasPlainTrueFalse) sb.append("(cần xem ảnh để biết Đúng/Sai nào đang được chọn)\n")
         fun flush() {
             if (run.isEmpty()) return
             val joined = run.joinToString("") { items[it].text }
@@ -400,8 +464,10 @@ class AutoAnswerService : AccessibilityService() {
                 run.add(i)
             } else {
                 flush()
+                if (!item.ctrl && !item.input && sb.isNotEmpty() && headerRe.containsMatchIn(t.trim())) sb.append("---\n")
                 if (item.ctrl) sb.append("[${i + 1}] ").append(if (item.checked) "☑ " else "☐ ").append(t).append('\n')
-                else if (item.input) sb.append("[${i + 1}] ✎ ").append(t).append('\n')
+                else if (item.input) sb.append("[${i + 1}] ✎ ")
+                    .append(if (item.maxLen > 0) "(tối đa ${item.maxLen} ký tự) " else "").append(t).append('\n')
                 else sb.append("[${i + 1}] ").append(t).append('\n')
             }
         }
@@ -468,7 +534,8 @@ class AutoAnswerService : AccessibilityService() {
         val cur = resolve(act.item, act.occ)
         val next = { handler.postDelayed({ chooseAll(acts, index + 1) }, 30) }
         if (act.text != null) {
-            if (!typeInto(cur.node, act.text)) toast("Không gõ được vào ô nhập (ứng dụng chặn)")
+            val limited = if (cur.maxLen > 0) act.text.take(cur.maxLen) else act.text
+            if (!typeInto(cur.node, limited)) toast("Không gõ được vào ô nhập (ứng dụng chặn)")
             next()
             return
         }
