@@ -105,6 +105,53 @@ class CaptureService : Service() {
             }
         }
 
+        @Volatile private var snapTs = 0L
+        @Volatile private var snapCache: IntArray? = null
+
+        // Bản "dấu vân tay" rất nhỏ của màn hình hiện tại (lưới 24x48 ô, độ sáng trung bình), dùng để biết màn hình
+        // có thật sự đổi (đã cuộn / sang câu mới) hay chưa ngay cả khi cây giao diện không đổi (trang web).
+        fun snapshot(): IntArray? {
+            if (reader == null) return null
+            return synchronized(lock) {
+                val image = latest ?: return@synchronized null
+                if (frameTs == snapTs && snapCache != null) return@synchronized snapCache
+                try {
+                    val plane = image.planes[0]
+                    val buf = plane.buffer
+                    val rs = plane.rowStride
+                    val ps = plane.pixelStride
+                    val gx = 24
+                    val gy = 48
+                    val out = IntArray(gx * gy)
+                    for (cy in 2 until gy - 2) {          // bỏ thanh trạng thái (đồng hồ) và thanh điều hướng
+                        for (cx in 0 until gx) {
+                            var sum = 0
+                            for (k in 0 until 4) {
+                                val px = ((cx + 0.25f + 0.5f * (k % 2)) * w / gx).toInt().coerceIn(0, w - 1)
+                                val py = ((cy + 0.25f + 0.5f * (k / 2)) * h / gy).toInt().coerceIn(0, h - 1)
+                                val o = py * rs + px * ps
+                                sum += ((buf.get(o).toInt() and 0xff) + (buf.get(o + 1).toInt() and 0xff) + (buf.get(o + 2).toInt() and 0xff)) / 3
+                            }
+                            out[cy * gx + cx] = sum / 4
+                        }
+                    }
+                    snapCache = out
+                    snapTs = frameTs
+                    out
+                } catch (e: Exception) {
+                    null
+                }
+            }
+        }
+
+        // true nếu hai màn hình khác nhau rõ rệt (hơn ~6% số ô đổi độ sáng đáng kể); thay đổi nhỏ (con trỏ, ô tích) không tính.
+        fun differs(a: IntArray, b: IntArray): Boolean {
+            if (a.size != b.size) return true
+            var n = 0
+            for (i in a.indices) if (Math.abs(a[i] - b[i]) > 20) n++
+            return n > 63
+        }
+
         internal fun clearFrames() {
             synchronized(lock) {
                 try { latest?.close() } catch (e: Exception) { }
@@ -112,6 +159,8 @@ class CaptureService : Service() {
                 cached = null
                 cachedTs = 0L
                 cachedSide = -1
+                snapTs = 0L
+                snapCache = null
                 blackFrame = false
             }
         }
