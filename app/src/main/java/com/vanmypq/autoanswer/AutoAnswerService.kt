@@ -98,6 +98,53 @@ class AutoAnswerService : AccessibilityService() {
     private var swipeFromSig = 0
     private var finished = false
     private var warnedBlack = false
+    private val visionHashes = HashSet<Int>()
+    private var settleSnap: IntArray? = null
+    private var visSnap: IntArray? = null
+    private var visId = 0
+    private var settleWaits = 0
+    private val optionRe = Regex("(?i)^\\(?[A-D]\\s*[.):]")
+
+    private fun realMetrics(): android.util.DisplayMetrics {
+        val dm = android.util.DisplayMetrics()
+        @Suppress("DEPRECATION")
+        (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+        return dm
+    }
+
+    private fun visionAllowed(): Boolean =
+        cfg().getBoolean("img", true) && CaptureService.isRunning() && !CaptureService.blackFrame
+
+    // Màn hình "chỉ có vỏ trình duyệt": cây giao diện không đưa ô chọn/phương án của trang web, nên không có [id] nào để chạm.
+    // Khi đó AI phải ĐỌC ẢNH và chỉ toạ độ ô cần chạm (chế độ nhìn ảnh).
+    private fun visionScreen(items: List<Item>): Boolean {
+        if (!visionAllowed()) return false
+        if (items.any { it.ctrl || optionRe.containsMatchIn(it.text.removePrefix("(chữ ẩn) ")) ||
+                it.text.trim() == "Đúng" || it.text.trim() == "Sai" }) return false
+        val plainLong = items.count { !it.input && !it.text.startsWith("(công thức)") && it.text.length >= 25 }
+        return plainLong < 2
+    }
+
+    // Màn hình đã đứng yên (2 lần chụp liên tiếp giống nhau) -> mới hỏi AI, tránh đọc ảnh lúc trang còn đang trôi.
+    private fun visualSettled(): Boolean {
+        val s = CaptureService.snapshot() ?: return true
+        val old = settleSnap
+        settleSnap = s
+        return old != null && !CaptureService.differs(old, s)
+    }
+
+    // Số hiệu màn hình theo HÌNH ẢNH: chỉ tăng khi màn hình đổi rõ rệt (cuộn / sang câu mới).
+    private fun visualId(): Int {
+        val s = CaptureService.snapshot() ?: return visId
+        val old = visSnap
+        if (old == null || CaptureService.differs(old, s)) { visSnap = s; visId++ }
+        return visId
+    }
+
+    private fun curHashOf(items: List<Item>, vision: Boolean): Int =
+        if (vision) sig(items) * 31 + visualId() else sig(items)
+
+    private fun curHash(items: List<Item>): Int = curHashOf(items, visionScreen(items))
     private val navLog = ArrayList<String>()
     private fun navNote(m: String) { navLog.add(m); if (navLog.size > 12) navLog.removeAt(0) }
 
@@ -180,7 +227,12 @@ class AutoAnswerService : AccessibilityService() {
     // Chỉ coi là "đã hết" khi KHÔNG cách nào làm nội dung đổi (không tin vào việc lệnh trả về true).
     private fun doScroll(down: Boolean, onResult: (Int) -> Unit) {
         val before = layoutOf(collect())
-        fun changed() = layoutOf(collect()) != before
+        val vb = CaptureService.snapshot()
+        fun changed(): Boolean {
+            if (layoutOf(collect()) != before) return true
+            val vn = CaptureService.snapshot()
+            return vb != null && vn != null && CaptureService.differs(vb, vn)
+        }
         fun step3() {
             swipeScroll(down, 0.25f) { ok ->
                 handler.postDelayed({
@@ -390,6 +442,9 @@ class AutoAnswerService : AccessibilityService() {
         navCooldown = 0L
         markActive()
         slowHashes.clear()
+        visionHashes.clear()
+        settleSnap = null
+        visSnap = null
         status = if (auto) "đang quét" else ""
         refresh()
         handler.removeCallbacks(loop)
@@ -424,6 +479,8 @@ class AutoAnswerService : AccessibilityService() {
         }
         val items = collect()
         if (items.sumOf { it.text.length } >= 40) {
+            process(items, key)
+        } else if (visionAllowed() && navAllowed()) {
             process(items, key)
         } else if (Build.VERSION.SDK_INT >= 30) {
             ocrThenProcess(key)
@@ -634,8 +691,14 @@ class AutoAnswerService : AccessibilityService() {
     }
 
     private fun process(items: List<Item>, key: String) {
-        if (items.isEmpty()) return
-        val h = sig(items)
+        val vision = visionScreen(items)
+        if (items.isEmpty() && !vision) return
+        if (vision) {
+            // Trang có hiệu ứng chuyển động liên tục thì chỉ chờ tối đa ~3 giây rồi vẫn xử lý.
+            if (!visualSettled() && ++settleWaits < 20) { setStatus("chờ trang ổn định…"); return }
+            settleWaits = 0
+        }
+        val h = curHashOf(items, vision)
         if (h != currentHash) { currentHash = h; retries = 0; finished = false; markActive() }
         if (h == lastHash) { maybeAdvance(items, h); return }
         val lh = layoutOf(items)
@@ -660,6 +723,11 @@ class AutoAnswerService : AccessibilityService() {
             }
         }
         val hasImg = CaptureService.isRunning()
+        val alwaysImg = cfg().getBoolean("img", true)
+        if (hasImg && alwaysImg && (vision || visionHashes.contains(h))) {
+            runVision(h, key)
+            return
+        }
         val text = buildPrompt(items)
         if (!hasImg && (text.contains("(công thức)") || text.contains("xem ảnh"))) {
             status = "⚠ CHƯA BẬT CHỤP MÀN HÌNH: mở app Auto Trắc Nghiệm > Cấp quyền chụp màn hình"
@@ -671,7 +739,6 @@ class AutoAnswerService : AccessibilityService() {
         busy = true
         val fast = getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("fast", true)
         val hasInput = items.any { it.input }
-        val alwaysImg = cfg().getBoolean("img", true)
         val longText0 = text.length > 1300
         setStatus(if (hasInput) "AI đang điền…" else if (longText0) "câu dài, đọc kỹ…" else if (fast) "AI nhanh…" else "AI đang suy nghĩ…")
         lastSent = text
@@ -704,7 +771,7 @@ class AutoAnswerService : AccessibilityService() {
                     return@post
                 }
                 // Trong lúc chờ AI, màn hình có thể đã sang câu khác: bỏ kết quả cũ và hỏi lại, tránh chạm nhầm.
-                if (sig(collect()) != h && staleCount < 2) {
+                if (curHash(collect()) != h && staleCount < 2) {
                     staleCount++
                     lastHash = 0
                     layoutHash = 0
@@ -741,10 +808,12 @@ class AutoAnswerService : AccessibilityService() {
                     // Nhanh không ra kết quả: lần sau TỰ chuyển sang chế độ chính xác (có ảnh, suy nghĩ kỹ)
                     // cho đúng câu này, thay vì lặp lại y hệt lần thử trước.
                     if (effFast) slowHashes.add(h)
-                    status = "thử lại, chế độ chính xác ($retries)"
+                    if (hasImg && alwaysImg) visionHashes.add(h)
+                    status = if (hasImg && alwaysImg) "thử lại bằng cách nhìn ảnh" else "thử lại, chế độ chính xác ($retries)"
                     refresh()
                 } else {
                     slowHashes.remove(h)
+                    visionHashes.remove(h)
                     status = "không thấy câu hỏi"
                     refresh()
                 }
@@ -758,9 +827,81 @@ class AutoAnswerService : AccessibilityService() {
     // lẫn phương án của câu này sang câu khác khi nhiều câu hiện cùng lúc trên một màn hình.
     private val headerRe = Regex("(?i)^(câu\\s*\\d+\\b|\\d{1,3}[.)])")
 
+    // CHẾ ĐỘ NHÌN ẢNH: gửi ảnh chụp, AI chọn đáp án và trả toạ độ; app chạm đúng toạ độ đó trên màn hình bài tập.
+    private fun runVision(h: Int, key: String) {
+        lastHash = h
+        busy = true
+        setStatus("AI nhìn ảnh…")
+        lastSent = "(chế độ nhìn ảnh: chỉ gửi ảnh chụp màn hình, không có danh sách chữ)"
+        exec.execute {
+            var res: List<ClaudeClient.VTap> = emptyList()
+            var gotErr: String? = null
+            try {
+                res = ClaudeClient.askVision(key)
+            } catch (e: Exception) {
+                gotErr = e.message ?: "lỗi mạng"
+            }
+            val taps = res
+            val err = gotErr
+            handler.post {
+                busy = false
+                markActive()
+                if (err != null) {
+                    lastHash = 0
+                    if (err.contains("đen")) {
+                        cooldownUntil = SystemClock.uptimeMillis() + 300
+                        if (!warnedBlack) {
+                            warnedBlack = true
+                            toast("Ảnh chụp bị ĐEN: app này chặn chụp màn hình, không thể nhìn ảnh")
+                        }
+                    } else {
+                        cooldownUntil = SystemClock.uptimeMillis() + (if (err.contains("429")) 30000L else 6000L)
+                        status = "lỗi: " + err.take(80)
+                        refresh()
+                        toast(err)
+                    }
+                    return@post
+                }
+                if (curHash(collect()) != h && staleCount < 2) {
+                    staleCount++
+                    lastHash = 0
+                    status = "màn hình đã đổi, nhìn lại…"
+                    refresh()
+                    return@post
+                }
+                staleCount = 0
+                if (taps.isEmpty()) {
+                    status = "không có câu mới trên màn hình"
+                    refresh()
+                    return@post
+                }
+                status = "chạm ${taps.size} đáp án (nhìn ảnh)"
+                refresh()
+                tapPoints(taps.map { Pair(it.x.toFloat(), it.y.toFloat()) }, 0)
+            }
+        }
+    }
+
+    private fun tapPoints(pts: List<Pair<Float, Float>>, i: Int) {
+        tapping = true
+        tapStart = SystemClock.uptimeMillis()
+        if (i >= pts.size) {
+            tapping = false
+            cooldownUntil = SystemClock.uptimeMillis() + 350
+            afterTap()
+            return
+        }
+        val dm = realMetrics()
+        val px = (pts[i].first / 1000f * dm.widthPixels).toInt()
+        val py = (pts[i].second / 1000f * dm.heightPixels).toInt()
+        tap(Rect(px - 1, py - 1, px + 1, py + 1)) {
+            handler.postDelayed({ tapPoints(pts, i + 1) }, 150)
+        }
+    }
+
     // Vị trí tương đối của phần tử trên màn hình (%), để AI đối chiếu ô chọn với phương án trong ảnh chụp.
     private fun posTag(r: Rect): String {
-        val dm = resources.displayMetrics
+        val dm = realMetrics()
         val x = (r.exactCenterX() * 100f / dm.widthPixels).toInt().coerceIn(0, 100)
         val y = (r.exactCenterY() * 100f / dm.heightPixels).toInt().coerceIn(0, 100)
         return "{x=$x% y=$y%}"
@@ -912,7 +1053,7 @@ class AutoAnswerService : AccessibilityService() {
     private fun afterTap() {
         handler.postDelayed({
             val items2 = collect()
-            val h2 = sig(items2)
+            val h2 = curHash(items2)
             lastHash = h2
             currentHash = h2
             layoutHash = layoutOf(items2)
@@ -938,7 +1079,7 @@ class AutoAnswerService : AccessibilityService() {
     }
 
     private fun tap(r: Rect, onDone: (Boolean) -> Unit) {
-        val dm = resources.displayMetrics
+        val dm = realMetrics()
         val x = r.exactCenterX().coerceIn(2f, dm.widthPixels - 2f)
         val y = r.exactCenterY().coerceIn(2f, dm.heightPixels - 2f)
         val p = Path().apply { moveTo(x, y) }
