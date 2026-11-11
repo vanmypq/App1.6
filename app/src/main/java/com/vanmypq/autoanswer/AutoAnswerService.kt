@@ -84,6 +84,216 @@ class AutoAnswerService : AccessibilityService() {
     private var staleCount = 0
     private val clockRe = Regex("\\d{1,2}:\\d{2}(:\\d{2})?")
 
+
+    // ===== CUỘN TRANG / QUA TRANG (v1.9) =====
+    private val settleMs = 600L
+    private var lastActivity = 0L
+    private var navCooldown = 0L
+    private var navBusy = false
+    private var navStart = 0L
+    private var bottomReached = false
+    private var scrollStuck = 0
+    private var navFromSig = 0
+    private var navSame = 0
+    private var swipeFromSig = 0
+    private var finished = false
+
+    private val nextRe = Regex(
+        "(?i)^\\s*(›|»|>|>>|→|tiếp( theo| tục)?|câu (tiếp( theo)?|sau)|trang (tiếp( theo)?|sau)|bài (tiếp( theo)?|sau)|" +
+            "next( page| question)?|continue|sau|chuyển câu|qua câu)\\s*(›|»|>|→)?\\s*$"
+    )
+    private val prevRe = Regex(
+        "(?i)^\\s*(‹|«|<|<<|←|trước|câu trước|trang trước|bài trước|previous( page| question)?|prev|back|quay lại)\\s*$"
+    )
+    private val submitRe = Regex(
+        "(?i)^\\s*(nộp bài|hoàn thành|hoàn tất|kết thúc|gửi bài|submit|finish|done)\\s*$"
+    )
+
+    private fun cfg() = getSharedPreferences("cfg", MODE_PRIVATE)
+    private fun markActive() { lastActivity = SystemClock.uptimeMillis() }
+    private fun shortToast(msg: String) = handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+
+    // 1 = đã cuộn; 0 = có vùng cuộn nhưng không cuộn thêm được (cuối/đầu trang); -1 = không thấy vùng cuộn nào.
+    private fun scrollByAction(down: Boolean): Int {
+        val root = rootInActiveWindow ?: return -1
+        val dm = resources.displayMetrics
+        val screenArea = dm.widthPixels.toLong() * dm.heightPixels
+        val cands = ArrayList<Pair<Long, AccessibilityNodeInfo>>()
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 40 || !n.isVisibleToUser) return
+            if (n.isScrollable) {
+                val r = Rect(); n.getBoundsInScreen(r)
+                val area = r.width().toLong() * r.height()
+                if (area >= screenArea * 0.3) cands.add(Pair(area, n))
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1) }
+        }
+        walk(root, 0)
+        cands.sortByDescending { it.first }
+        var tried = false
+        val wantId = if (down) AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN.id
+                     else AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.id
+        val fwdId = if (down) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        for ((_, n) in cands) {
+            val cn = n.className?.toString() ?: ""
+            if (cn.contains("Horizontal") || cn.contains("ViewPager")) continue
+            tried = true
+            n.refresh()
+            val ids = n.actionList.map { it.id }
+            if (wantId in ids && n.performAction(wantId)) return 1
+            if (fwdId in ids && n.performAction(fwdId)) return 1
+        }
+        return if (tried) 0 else -1
+    }
+
+    private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, dur: Long, onDone: (Boolean) -> Unit) {
+        val p = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
+        val g = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, dur)).build()
+        val ok = dispatchGesture(g, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { onDone(true) }
+            override fun onCancelled(gestureDescription: GestureDescription?) { onDone(false) }
+        }, handler)
+        if (!ok) onDone(false)
+    }
+
+    private fun swipeScroll(down: Boolean, onDone: (Boolean) -> Unit) {
+        val dm = resources.displayMetrics
+        val x = dm.widthPixels * 0.5f
+        val a = dm.heightPixels * 0.72f
+        val b = dm.heightPixels * 0.30f
+        if (down) swipe(x, a, x, b, 280, onDone) else swipe(x, b, x, a, 280, onDone)
+    }
+
+    private fun swipePage(forward: Boolean, onDone: (Boolean) -> Unit) {
+        val dm = resources.displayMetrics
+        val y = dm.heightPixels * 0.5f
+        val a = dm.widthPixels * 0.85f
+        val b = dm.widthPixels * 0.15f
+        if (forward) swipe(a, y, b, y, 250, onDone) else swipe(b, y, a, y, 250, onDone)
+    }
+
+    // Cuộn một đoạn rồi báo kết quả: 1 = nội dung đã đổi, 0 = chưa đổi (chưa chắc), 2 = chắc chắn đã hết.
+    private fun doScroll(down: Boolean, onResult: (Int) -> Unit) {
+        val before = sig(collect())
+        val check = {
+            handler.postDelayed({ onResult(if (sig(collect()) != before) 1 else 0) }, 450)
+        }
+        when (scrollByAction(down)) {
+            1 -> check()
+            0 -> onResult(2)
+            else -> swipeScroll(down) { check() }
+        }
+    }
+
+    private fun navEnabled(n: AccessibilityNodeInfo): Boolean {
+        n.refresh()
+        var cur: AccessibilityNodeInfo? = n
+        var d = 0
+        while (cur != null && d < 5) {
+            if (cur.isClickable) return cur.isEnabled
+            cur = cur.parent
+            d++
+        }
+        return n.isEnabled
+    }
+
+    private fun findNavButton(items: List<Item>, re: Regex): Item? =
+        items.filter { !it.input && !it.ctrl && it.text.length <= 25 && re.containsMatchIn(it.text.trim()) }
+            .filter { it.node == null || navEnabled(it.node) }
+            .maxByOrNull { it.rect.top }
+
+    private fun clickAncestor(n: AccessibilityNodeInfo): Boolean {
+        n.refresh()
+        var cur: AccessibilityNodeInfo? = n
+        var d = 0
+        while (cur != null && d < 5) {
+            if (cur.isClickable && cur.isEnabled) return cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            cur = cur.parent
+            d++
+        }
+        return false
+    }
+
+    private fun pressItem(it: Item, onDone: () -> Unit) {
+        val n = it.node
+        if (n != null && clickAncestor(n)) { onDone(); return }
+        tap(it.rect) { ok ->
+            if (!ok) clickNode(it.node)
+            onDone()
+        }
+    }
+
+    private fun afterNav() {
+        handler.postDelayed({
+            navBusy = false
+            bottomReached = false
+            scrollStuck = 0
+            markActive()
+            navCooldown = SystemClock.uptimeMillis() + 400
+        }, 350)
+    }
+
+    private fun finishRun(msg: String) {
+        finished = true
+        status = "✔ $msg"
+        refresh()
+        toast(msg)
+    }
+
+    // Không chạy ở màn hình của chính app hoặc thanh hệ thống (tránh cuộn/bấm nhầm khi đã thoát khỏi bài).
+    private fun navAllowed(): Boolean {
+        val pkg = rootInActiveWindow?.packageName?.toString() ?: return false
+        return pkg != packageName && pkg != "com.android.systemui"
+    }
+
+    // Gọi khi màn hình đã xử lý xong và đứng yên: cuộn xuống tìm câu mới; hết trang thì bấm nút Tiếp theo.
+    private fun maybeAdvance(items: List<Item>, h: Int) {
+        if (navBusy || finished) return
+        val p = cfg()
+        val optScroll = p.getBoolean("scroll", true)
+        val optNext = p.getBoolean("next", true)
+        if (!optScroll && !optNext) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastActivity < settleMs || now < navCooldown) return
+        if (!navAllowed()) return
+        if (optScroll && !bottomReached) {
+            navBusy = true; navStart = now
+            setStatus("cuộn xuống tìm câu mới…")
+            doScroll(true) { r ->
+                navBusy = false
+                markActive()
+                if (r == 1) scrollStuck = 0
+                else {
+                    scrollStuck++
+                    if (r == 2 || scrollStuck >= 2) bottomReached = true
+                }
+            }
+            return
+        }
+        if (optNext) goNext(items, h) else finishRun("đã hết trang")
+    }
+
+    private fun goNext(items: List<Item>, h: Int) {
+        val allowSubmit = cfg().getBoolean("submit", false)
+        val btn = findNavButton(items, nextRe) ?: (if (allowSubmit) findNavButton(items, submitRe) else null)
+        if (btn == null) {
+            if (cfg().getBoolean("swipe", false) && h != swipeFromSig) {
+                swipeFromSig = h
+                navBusy = true; navStart = SystemClock.uptimeMillis()
+                setStatus("vuốt sang trang…")
+                swipePage(true) { afterNav() }
+                return
+            }
+            finishRun("đã làm hết, không thấy nút Tiếp theo")
+            return
+        }
+        if (h == navFromSig) navSame++ else { navFromSig = h; navSame = 0 }
+        if (navSame >= 2) { finishRun("không qua được trang tiếp"); return }
+        navBusy = true; navStart = SystemClock.uptimeMillis()
+        setStatus("qua trang: " + btn.text.take(20))
+        pressItem(btn) { afterNav() }
+    }
+
     private val idleTicker = object : Runnable {
         override fun run() {
             if (!auto) refresh()
@@ -142,6 +352,15 @@ class AutoAnswerService : AccessibilityService() {
         cooldownUntil = 0L
         tapping = false
         staleCount = 0
+        finished = false
+        bottomReached = false
+        scrollStuck = 0
+        navSame = 0
+        navFromSig = 0
+        swipeFromSig = 0
+        navBusy = false
+        navCooldown = 0L
+        markActive()
         slowHashes.clear()
         status = if (auto) "đang quét" else ""
         refresh()
@@ -169,7 +388,8 @@ class AutoAnswerService : AccessibilityService() {
 
     private fun tick() {
         if (tapping && SystemClock.uptimeMillis() - tapStart > 4000) tapping = false  // chuỗi chạm bị kẹt
-        if (busy || tapping || SystemClock.uptimeMillis() < cooldownUntil) return
+        if (navBusy && SystemClock.uptimeMillis() - navStart > 4000) navBusy = false  // cuộn/qua trang bị kẹt
+        if (busy || tapping || navBusy || SystemClock.uptimeMillis() < cooldownUntil) return
         val key = getSharedPreferences("cfg", MODE_PRIVATE).getString("key", "") ?: ""
         if (key.isBlank()) {
             toast("Chưa nhập API key"); auto = false; refresh(); return
@@ -326,8 +546,8 @@ class AutoAnswerService : AccessibilityService() {
     private fun process(items: List<Item>, key: String) {
         if (items.isEmpty()) return
         val h = sig(items)
-        if (h != currentHash) { currentHash = h; retries = 0 }
-        if (h == lastHash) return
+        if (h != currentHash) { currentHash = h; retries = 0; finished = false; markActive() }
+        if (h == lastHash) { maybeAdvance(items, h); return }
         val lh = layoutOf(items)
         if (lh != layoutHash) {
             layoutHash = lh
@@ -378,6 +598,7 @@ class AutoAnswerService : AccessibilityService() {
             val err: String? = gotErr
             handler.post {
                 busy = false
+                markActive()
                 if (err != null) {
                     lastHash = 0
                     val wait = if (err.contains("429")) 30000L else 6000L
@@ -574,6 +795,7 @@ class AutoAnswerService : AccessibilityService() {
             lastHash = h2
             currentHash = h2
             layoutHash = layoutOf(items2)
+            markActive()
         }, 180)
     }
 
