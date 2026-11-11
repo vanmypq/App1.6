@@ -97,6 +97,8 @@ class AutoAnswerService : AccessibilityService() {
     private var navSame = 0
     private var swipeFromSig = 0
     private var finished = false
+    private val navLog = ArrayList<String>()
+    private fun navNote(m: String) { navLog.add(m); if (navLog.size > 12) navLog.removeAt(0) }
 
     private val nextRe = Regex(
         "(?i)^\\s*(›|»|>|>>|→|tiếp( theo| tục)?|câu (tiếp( theo)?|sau)|trang (tiếp( theo)?|sau)|bài (tiếp( theo)?|sau)|" +
@@ -124,7 +126,7 @@ class AutoAnswerService : AccessibilityService() {
             if (n.isScrollable) {
                 val r = Rect(); n.getBoundsInScreen(r)
                 val area = r.width().toLong() * r.height()
-                if (area >= screenArea * 0.3) cands.add(Pair(area, n))
+                if (area >= screenArea * 0.12) cands.add(Pair(area, n))
             }
             for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1) }
         }
@@ -156,12 +158,12 @@ class AutoAnswerService : AccessibilityService() {
         if (!ok) onDone(false)
     }
 
-    private fun swipeScroll(down: Boolean, onDone: (Boolean) -> Unit) {
+    private fun swipeScroll(down: Boolean, xFrac: Float, onDone: (Boolean) -> Unit) {
         val dm = resources.displayMetrics
-        val x = dm.widthPixels * 0.5f
-        val a = dm.heightPixels * 0.72f
+        val x = dm.widthPixels * xFrac
+        val a = dm.heightPixels * 0.75f
         val b = dm.heightPixels * 0.30f
-        if (down) swipe(x, a, x, b, 280, onDone) else swipe(x, b, x, a, 280, onDone)
+        if (down) swipe(x, a, x, b, 300, onDone) else swipe(x, b, x, a, 300, onDone)
     }
 
     private fun swipePage(forward: Boolean, onDone: (Boolean) -> Unit) {
@@ -172,16 +174,40 @@ class AutoAnswerService : AccessibilityService() {
         if (forward) swipe(a, y, b, y, 250, onDone) else swipe(b, y, a, y, 250, onDone)
     }
 
-    // Cuộn một đoạn rồi báo kết quả: 1 = nội dung đã đổi, 0 = chưa đổi (chưa chắc), 2 = chắc chắn đã hết.
+    // Cuộn một đoạn rồi báo kết quả: 1 = nội dung đã đổi (cuộn được), 0 = cả 3 cách đều không đổi.
+    // Thử lần lượt: (1) lệnh cuộn của Trợ năng, (2) vuốt giữa màn hình, (3) vuốt lệch bên.
+    // Chỉ coi là "đã hết" khi KHÔNG cách nào làm nội dung đổi (không tin vào việc lệnh trả về true).
     private fun doScroll(down: Boolean, onResult: (Int) -> Unit) {
-        val before = sig(collect())
-        val check = {
-            handler.postDelayed({ onResult(if (sig(collect()) != before) 1 else 0) }, 450)
+        val before = layoutOf(collect())
+        fun changed() = layoutOf(collect()) != before
+        fun step3() {
+            swipeScroll(down, 0.25f) { ok ->
+                handler.postDelayed({
+                    val c = changed()
+                    navNote("vuốt lệch: gesture=$ok đổi=$c")
+                    onResult(if (c) 1 else 0)
+                }, 500)
+            }
         }
-        when (scrollByAction(down)) {
-            1 -> check()
-            0 -> onResult(2)
-            else -> swipeScroll(down) { check() }
+        fun step2() {
+            swipeScroll(down, 0.5f) { ok ->
+                handler.postDelayed({
+                    val c = changed()
+                    navNote("vuốt giữa: gesture=$ok đổi=$c")
+                    if (c) onResult(1) else step3()
+                }, 500)
+            }
+        }
+        val r = scrollByAction(down)
+        if (r == 1) {
+            handler.postDelayed({
+                val c = changed()
+                navNote("lệnh cuộn: đổi=$c")
+                if (c) onResult(1) else step2()
+            }, 400)
+        } else {
+            navNote("lệnh cuộn: không dùng được (mã $r)")
+            step2()
         }
     }
 
@@ -234,6 +260,7 @@ class AutoAnswerService : AccessibilityService() {
     }
 
     private fun finishRun(msg: String) {
+        navNote("KẾT THÚC: $msg")
         finished = true
         status = "✔ $msg"
         refresh()
@@ -265,7 +292,7 @@ class AutoAnswerService : AccessibilityService() {
                 if (r == 1) scrollStuck = 0
                 else {
                     scrollStuck++
-                    if (r == 2 || scrollStuck >= 2) bottomReached = true
+                    if (scrollStuck >= 2) bottomReached = true
                 }
             }
             return
@@ -325,7 +352,7 @@ class AutoAnswerService : AccessibilityService() {
             setOnClickListener { toggle() }
             setOnLongClickListener {
                 val cm = this@AutoAnswerService.getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                cm.setPrimaryClip(android.content.ClipData.newPlainText("ai-input", ClaudeClient.lastInfo + "\n\n" + lastSent))
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("ai-input", ClaudeClient.lastInfo + "\n\n" + lastSent + "\n\nNHẬT KÝ CUỘN:\n" + navLog.joinToString("\n")))
                 toast("Đã sao chép dữ liệu app đọc được (dán vào chat để xem)")
                 true
             }
@@ -439,26 +466,80 @@ class AutoAnswerService : AccessibilityService() {
         return abs(w - h) <= 0.35f * maxOf(w, h)
     }
 
-    // Ô tích chọn không có chữ: gắn nhãn bằng chữ cùng hàng (ưu tiên bên phải) để AI biết ô nào ứng với đáp án nào.
+    private val plainRe = Regex("\\p{L}{2,}\\s+\\p{L}{2,}\\s+\\p{L}{2,}")
+
+    // Chữ thường bị trình duyệt ẩn (câu hỏi, tiêu đề) khác với công thức toán: không có ký hiệu toán, ít chữ số.
+    private fun isPlainText(t: String): Boolean {
+        if (!plainRe.containsMatchIn(t)) return false
+        if (t.any { it in "^=+*/√²³≤≥<>|{}\\∑π∞" }) return false
+        return t.count { it.isDigit() } <= 4
+    }
+
+    private val questionStartRe = Regex("(?i)^câu\\s*\\d+")
+
+    private fun isQuestionLine(text: String): Boolean {
+        val t = text.removePrefix("(chữ ẩn) ").removePrefix("(công thức) ").trim()
+        return questionStartRe.containsMatchIn(t) || t.endsWith("?") || t.endsWith(":")
+    }
+
+    private fun countChoices(n: AccessibilityNodeInfo, depth: Int): Int {
+        if (depth > 6) return 0
+        var c = if (isChoiceNode(n)) 1 else 0
+        for (i in 0 until n.childCount) n.getChild(i)?.let { c += countChoices(it, depth + 1) }
+        return c
+    }
+
+    // Lấy chữ của phương án từ chính cây giao diện: nút "gán nhãn" (labeledBy) hoặc nút cha chỉ chứa DUY NHẤT ô này.
+    private fun nodeLabel(n: AccessibilityNodeInfo): String {
+        try {
+            n.labeledBy?.let { l ->
+                val t = gather(l, 0).trim()
+                if (t.isNotEmpty()) return t.take(150)
+            }
+            val p = n.parent ?: return ""
+            if (countChoices(p, 0) != 1) return ""
+            val t = gather(p, 0).trim()
+            return if (t.length in 1..300) t.take(150) else ""
+        } catch (e: Exception) {
+            return ""
+        }
+    }
+
+    // Ô tích chọn không có chữ: lấy nhãn từ cây giao diện, nếu không có thì chữ cùng hàng (ưu tiên bên phải),
+    // nếu vẫn không có thì đặt tên theo THỨ TỰ trong câu (A, B, C, D...) để AI nhìn ảnh rồi chọn đúng ô.
     private fun labelControls(list: ArrayList<Item>): List<Item> {
         var k = 0
+        var prev: Item? = null
         for (i in list.indices) {
             val c = list[i]
-            if (!c.ctrl || c.text.isNotEmpty()) continue
-            var best: Item? = null
-            var bestGap = Int.MAX_VALUE
-            for (o in list) {
-                if (o === c || o.ctrl || o.text.isEmpty()) continue
-                val top = maxOf(o.rect.top, c.rect.top)
-                val bot = minOf(o.rect.bottom, c.rect.bottom)
-                if ((bot - top) < 0.5f * minOf(o.rect.height(), c.rect.height())) continue
-                val gap = if (o.rect.left >= c.rect.right - 10) o.rect.left - c.rect.right
-                          else 100000 + maxOf(0, c.rect.left - o.rect.right)
-                if (gap < bestGap) { bestGap = gap; best = o }
+            if (!c.ctrl) {
+                if (!c.input && isQuestionLine(c.text)) k = 0
+                continue
             }
-            val label = best?.text?.take(150)
+            val pv = prev
+            if (pv != null && c.rect.top - pv.rect.bottom > 2.5f * maxOf(c.rect.height(), 1)) k = 0
             k++
-            list[i] = c.copy(text = if (label != null) "(ô chọn) $label" else "(ô chọn trống $k)")
+            prev = c
+            if (c.text.isNotEmpty()) continue
+            var label = c.node?.let { nodeLabel(it) } ?: ""
+            if (label.isEmpty()) {
+                var best: Item? = null
+                var bestGap = Int.MAX_VALUE
+                for (o in list) {
+                    if (o === c || o.ctrl || o.text.isEmpty()) continue
+                    // Bỏ khối chữ to bằng cả khung (tiêu đề/nút cha), chỉ nhận chữ cỡ một dòng.
+                    if (o.rect.height() > 4 * maxOf(c.rect.height(), 60)) continue
+                    val top = maxOf(o.rect.top, c.rect.top)
+                    val bot = minOf(o.rect.bottom, c.rect.bottom)
+                    if ((bot - top) < 0.5f * minOf(o.rect.height(), c.rect.height())) continue
+                    val gap = if (o.rect.left >= c.rect.right - 10) o.rect.left - c.rect.right
+                              else 100000 + maxOf(0, c.rect.left - o.rect.right)
+                    if (gap < bestGap) { bestGap = gap; best = o }
+                }
+                label = best?.text?.take(150) ?: ""
+            }
+            val letter = if (k in 1..26) ('A' + (k - 1)).toString() else k.toString()
+            list[i] = c.copy(text = if (label.isNotEmpty()) "(ô chọn) $label" else "(ô chọn $letter - chưa có chữ, xem ảnh)")
         }
         return list
     }
@@ -489,7 +570,15 @@ class AutoAnswerService : AccessibilityService() {
                 // Nút ẩn nằm trong nút đang hiện (ví dụ công thức KaTeX/MathML): lấy chữ, chạm vào vùng của nút cha.
                 val t = gather(n, 0).trim()
                 if (t.isNotEmpty() && !parentRect.isEmpty) {
-                    out.add(Item("(công thức) " + t.take(800), Rect(parentRect), n))
+                    val own = Rect(); n.getBoundsInScreen(own)
+                    val dm = resources.displayMetrics
+                    var rect = Rect(parentRect)
+                    if (!own.isEmpty) {
+                        // Trình duyệt web liệt kê cả chữ ở phần chưa cuộn tới: bỏ qua, kẻo AI tưởng đó là câu đang hiện.
+                        if (own.bottom <= 0 || own.top >= dm.heightPixels || own.right <= 0 || own.left >= dm.widthPixels) return
+                        if (own.height() < dm.heightPixels * 0.6f) rect = own
+                    }
+                    out.add(Item((if (isPlainText(t)) "(chữ ẩn) " else "(công thức) ") + t.take(800), rect, n))
                 }
             }
         }
@@ -571,7 +660,7 @@ class AutoAnswerService : AccessibilityService() {
         }
         val hasImg = CaptureService.isRunning()
         val text = buildPrompt(items)
-        if (!hasImg && (text.contains("(công thức)") || text.contains("(cần xem ảnh"))) {
+        if (!hasImg && (text.contains("(công thức)") || text.contains("xem ảnh"))) {
             status = "⚠ CHƯA BẬT CHỤP MÀN HÌNH: mở app Auto Trắc Nghiệm > Cấp quyền chụp màn hình"
             refresh()
             cooldownUntil = SystemClock.uptimeMillis() + 3000
@@ -689,8 +778,9 @@ class AutoAnswerService : AccessibilityService() {
                 flush()
                 // Chỉ chèn vạch khi đây là một dòng tiêu đề NGẮN đứng riêng (vd "8. Chọn đáp án đúng nhất"),
                 // không chèn giữa đoạn hướng dẫn/giải thích dài lỡ bắt đầu bằng số thứ tự.
-                if (!item.ctrl && !item.input && sb.isNotEmpty() && t.trim().length <= 60 &&
-                    headerRe.containsMatchIn(t.trim())) sb.append("---\n")
+                val tt = t.removePrefix("(chữ ẩn) ").removePrefix("(công thức) ").trim()
+                if (!item.ctrl && !item.input && sb.isNotEmpty() &&
+                    ((tt.length <= 60 && headerRe.containsMatchIn(tt)) || questionStartRe.containsMatchIn(tt))) sb.append("---\n")
                 if (item.ctrl) sb.append("[${i + 1}] ").append(if (item.checked) "☑ " else "☐ ").append(t).append('\n')
                 else if (item.input) sb.append("[${i + 1}] ✎ ")
                     .append(if (item.maxLen > 0) "(tối đa ${item.maxLen} ký tự) " else "").append(t).append('\n')
@@ -719,7 +809,8 @@ class AutoAnswerService : AccessibilityService() {
         if (n != null && n.refresh()) {
             val r = Rect()
             n.getBoundsInScreen(r)
-            val stillMatches = item.text.isEmpty() || (n.text ?: n.contentDescription)?.toString()?.trim() == item.text
+            val stillMatches = item.text.isEmpty() || (n.text ?: n.contentDescription)?.toString()?.trim() == item.text ||
+                (item.ctrl && item.text.startsWith("(ô chọn") && abs(r.top - item.rect.top) < 200)
             if (!r.isEmpty && n.isVisibleToUser && stillMatches) return item.copy(rect = r)
         }
         val fresh = collect().filter { it.text == item.text }
