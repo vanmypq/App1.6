@@ -86,7 +86,7 @@ class AutoAnswerService : AccessibilityService() {
 
 
     // ===== CUỘN TRANG / QUA TRANG (v1.9) =====
-    private val settleMs = 600L
+    private val settleMs = 250L
     private var lastActivity = 0L
     private var navCooldown = 0L
     private var navBusy = false
@@ -98,6 +98,9 @@ class AutoAnswerService : AccessibilityService() {
     private var swipeFromSig = 0
     private var finished = false
     private var warnedBlack = false
+    private var nextScrollUnits = 0      // mức kéo trang do AI/ước tính đề nghị cho lần cuộn kế (0..1000 theo chiều cao, âm = kéo lên)
+    private var upCount = 0             // số lần liên tiếp phải kéo ngược lên (chống lặp lên-xuống khi câu dài hơn màn hình)
+    private var fastAdvance = false      // vừa chạm đáp án xong -> cuộn ngay, không chờ thêm
     private val visionHashes = HashSet<Int>()
     private var settleSnap: IntArray? = null
     private var visSnap: IntArray? = null
@@ -222,10 +225,61 @@ class AutoAnswerService : AccessibilityService() {
         if (forward) swipe(a, y, b, y, 250, onDone) else swipe(b, y, a, y, 250, onDone)
     }
 
-    // Cuộn một đoạn rồi báo kết quả: 1 = nội dung đã đổi (cuộn được), 0 = cả 3 cách đều không đổi.
-    // Thử lần lượt: (1) lệnh cuộn của Trợ năng, (2) vuốt giữa màn hình, (3) vuốt lệch bên.
-    // Chỉ coi là "đã hết" khi KHÔNG cách nào làm nội dung đổi (không tin vào việc lệnh trả về true).
-    private fun doScroll(down: Boolean, onResult: (Int) -> Unit) {
+    // Kiểm tra liên tục (mỗi 100ms) thay vì chờ cố định: có kết quả là đi tiếp ngay.
+    private fun pollUntil(maxMs: Long, cond: () -> Boolean, done: (Boolean) -> Unit) {
+        val t0 = SystemClock.uptimeMillis()
+        val r = object : Runnable {
+            override fun run() {
+                val ok = cond()
+                if (ok || SystemClock.uptimeMillis() - t0 >= maxMs) done(ok) else handler.postDelayed(this, 100)
+            }
+        }
+        handler.postDelayed(r, 100)
+    }
+
+    // Kéo trang CHÍNH XÁC một đoạn (đơn vị 0..1000 chiều cao màn hình): kéo rồi giữ yên ngón tay một chút để trang
+    // dừng đúng chỗ, không bị trượt thêm do đà (fling).
+    private fun dragScroll(down: Boolean, units: Int, onDone: (Boolean) -> Unit) {
+        val dm = realMetrics()
+        val hh = dm.heightPixels.toFloat()
+        val x = dm.widthPixels * 0.5f
+        val dist = units.coerceIn(100, 850) / 1000f * hh
+        val half = if (down) dist / 2 else -dist / 2
+        val y1 = (hh * 0.5f + half).coerceIn(hh * 0.06f, hh * 0.93f)
+        val y2 = (hh * 0.5f - half).coerceIn(hh * 0.06f, hh * 0.93f)
+        val dur = (dist / 1.6f).toLong().coerceIn(180L, 700L)
+        val p1 = Path().apply { moveTo(x, y1); lineTo(x, y2) }
+        val s1 = GestureDescription.StrokeDescription(p1, 0, dur, true)
+        val ok1 = dispatchGesture(GestureDescription.Builder().addStroke(s1).build(), object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                val p2 = Path().apply { moveTo(x, y2) }
+                val s2 = s1.continueStroke(p2, 0, 120, false)
+                val ok2 = dispatchGesture(GestureDescription.Builder().addStroke(s2).build(), object : GestureResultCallback() {
+                    override fun onCompleted(g: GestureDescription?) { onDone(true) }
+                    override fun onCancelled(g: GestureDescription?) { onDone(false) }
+                }, handler)
+                if (!ok2) onDone(false)
+            }
+            override fun onCancelled(gestureDescription: GestureDescription?) { onDone(false) }
+        }, handler)
+        if (!ok1) onDone(false)
+    }
+
+    // Không có đề nghị từ AI (trang đọc được bằng cây giao diện): ước tính từ vị trí dòng tiêu đề câu cuối cùng trên màn hình,
+    // kéo sao cho đầu câu đó lên sát mép trên để lần sau thấy trọn câu và các phương án của nó.
+    private fun guidedUnits(items: List<Item>): Int {
+        val hh = realMetrics().heightPixels
+        val hdr = items.filter {
+            !it.ctrl && !it.input && it.rect.height() < hh * 0.4 &&
+                (isQuestionLine(it.text) || headerRe.containsMatchIn(it.text.removePrefix("(chữ ẩn) ").trim()))
+        }.maxByOrNull { it.rect.top } ?: return 0
+        val top = hdr.rect.top * 1000 / hh
+        return if (top > 280) top - 80 else 0
+    }
+
+    // Cuộn một đoạn rồi báo kết quả: 1 = nội dung đã đổi (cuộn được), 0 = không cách nào làm nội dung đổi.
+    // units != 0: kéo chính xác theo mức đề nghị (dương = xuống, âm = lên); units == 0: cuộn mặc định (lệnh Trợ năng, rồi vuốt).
+    private fun doScroll(down: Boolean, units: Int, onResult: (Int) -> Unit) {
         val before = layoutOf(collect())
         val vb = CaptureService.snapshot()
         fun changed(): Boolean {
@@ -235,32 +289,38 @@ class AutoAnswerService : AccessibilityService() {
         }
         fun step3() {
             swipeScroll(down, 0.25f) { ok ->
-                handler.postDelayed({
-                    val c = changed()
+                pollUntil(500, { changed() }) { c ->
                     navNote("vuốt lệch: gesture=$ok đổi=$c")
                     onResult(if (c) 1 else 0)
-                }, 500)
+                }
             }
         }
-        fun step2() {
+        fun step2(last: Boolean) {
             swipeScroll(down, 0.5f) { ok ->
-                handler.postDelayed({
-                    val c = changed()
+                pollUntil(500, { changed() }) { c ->
                     navNote("vuốt giữa: gesture=$ok đổi=$c")
-                    if (c) onResult(1) else step3()
-                }, 500)
+                    if (c) onResult(1) else if (last) onResult(0) else step3()
+                }
             }
+        }
+        if (units != 0) {
+            dragScroll(down, Math.abs(units)) { ok ->
+                pollUntil(600, { changed() }) { c ->
+                    navNote("kéo $units: gesture=$ok đổi=$c")
+                    if (c) onResult(1) else step2(true)
+                }
+            }
+            return
         }
         val r = scrollByAction(down)
         if (r == 1) {
-            handler.postDelayed({
-                val c = changed()
+            pollUntil(400, { changed() }) { c ->
                 navNote("lệnh cuộn: đổi=$c")
-                if (c) onResult(1) else step2()
-            }, 400)
+                if (c) onResult(1) else step2(false)
+            }
         } else {
             navNote("lệnh cuộn: không dùng được (mã $r)")
-            step2()
+            step2(false)
         }
     }
 
@@ -338,8 +398,12 @@ class AutoAnswerService : AccessibilityService() {
         if (!navAllowed()) return
         if (optScroll && !bottomReached) {
             navBusy = true; navStart = now
-            setStatus("cuộn xuống tìm câu mới…")
-            doScroll(true) { r ->
+            var units = if (nextScrollUnits != 0) nextScrollUnits else guidedUnits(items)
+            nextScrollUnits = 0
+            if (units < 0 && ++upCount > 2) units = 750
+            if (Math.abs(units) < 120) units = 0
+            setStatus(if (units < 0) "kéo ngược lên cho đủ câu…" else "cuộn cho hiện đủ câu kế tiếp…")
+            doScroll(units >= 0, units) { r ->
                 navBusy = false
                 markActive()
                 if (r == 1) scrollStuck = 0
@@ -834,14 +898,15 @@ class AutoAnswerService : AccessibilityService() {
         setStatus("AI nhìn ảnh…")
         lastSent = "(chế độ nhìn ảnh: chỉ gửi ảnh chụp màn hình, không có danh sách chữ)"
         exec.execute {
-            var res: List<ClaudeClient.VTap> = emptyList()
+            var res = ClaudeClient.VResult(emptyList(), 0)
             var gotErr: String? = null
             try {
-                res = ClaudeClient.askVision(key)
+                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true))
             } catch (e: Exception) {
                 gotErr = e.message ?: "lỗi mạng"
             }
-            val taps = res
+            val taps = res.taps
+            val cuon = res.cuon
             val err = gotErr
             handler.post {
                 busy = false
@@ -870,8 +935,10 @@ class AutoAnswerService : AccessibilityService() {
                     return@post
                 }
                 staleCount = 0
+                nextScrollUnits = cuon
+                if (taps.isNotEmpty()) upCount = 0
                 if (taps.isEmpty()) {
-                    status = "không có câu mới trên màn hình"
+                    status = "chưa đủ câu hiện trọn, kéo trang…"
                     refresh()
                     return@post
                 }
@@ -887,7 +954,8 @@ class AutoAnswerService : AccessibilityService() {
         tapStart = SystemClock.uptimeMillis()
         if (i >= pts.size) {
             tapping = false
-            cooldownUntil = SystemClock.uptimeMillis() + 350
+            cooldownUntil = SystemClock.uptimeMillis() + 100
+            fastAdvance = true
             afterTap()
             return
         }
@@ -895,7 +963,7 @@ class AutoAnswerService : AccessibilityService() {
         val px = (pts[i].first / 1000f * dm.widthPixels).toInt()
         val py = (pts[i].second / 1000f * dm.heightPixels).toInt()
         tap(Rect(px - 1, py - 1, px + 1, py + 1)) {
-            handler.postDelayed({ tapPoints(pts, i + 1) }, 150)
+            handler.postDelayed({ tapPoints(pts, i + 1) }, 50)
         }
     }
 
@@ -1006,7 +1074,7 @@ class AutoAnswerService : AccessibilityService() {
         tapStart = SystemClock.uptimeMillis()
         if (index >= acts.size) {
             tapping = false
-            cooldownUntil = SystemClock.uptimeMillis() + 350
+            cooldownUntil = SystemClock.uptimeMillis() + 150
             afterTap()
             return
         }
@@ -1057,8 +1125,10 @@ class AutoAnswerService : AccessibilityService() {
             lastHash = h2
             currentHash = h2
             layoutHash = layoutOf(items2)
-            markActive()
-        }, 180)
+            // Vừa chạm xong ở chế độ nhìn ảnh: coi như đã đứng yên đủ lâu để cuộn ngay.
+            lastActivity = SystemClock.uptimeMillis() - (if (fastAdvance) settleMs else 0L)
+            fastAdvance = false
+        }, 100)
     }
 
     private fun clickNode(n: AccessibilityNodeInfo?) {
