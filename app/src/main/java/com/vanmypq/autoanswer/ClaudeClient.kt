@@ -27,7 +27,13 @@ object ClaudeClient {
         "màn hình. Dùng ảnh để đọc công thức, hình vẽ, bảng biểu mà danh sách chữ thiếu hoặc bị dính chữ " +
         "(ví dụ 'y2' nghĩa là y bình phương). Dòng '(công thức)' là công thức đã ghép lại, nằm ngay sau đáp án " +
         "đứng trước nó. Ký hiệu ☐ là ô tích chọn chưa chọn, ☑ là ô đã chọn, '(ô chọn) ...' là ô tích chọn kèm chữ " +
-        "cùng hàng. Hỗ trợ MỌI dạng: đáp án có chữ A/B/C/D; chỉ có ô tròn/ô vuông không có chữ cái (không cần tự " +
+        "cùng hàng. Dòng '(chữ ẩn) ...' là chữ thường (câu hỏi, tiêu đề) mà trình duyệt web ẩn khỏi danh sách: đọc như " +
+        "bình thường, ví dụ '(chữ ẩn) Câu 2: ...' là nội dung câu hỏi số 2. Ô '(ô chọn A - chưa có chữ, xem ảnh)', " +
+        "'(ô chọn B ...)', '(ô chọn C ...)', '(ô chọn D ...)' là ô tích chọn KHÔNG kèm chữ phương án: A là ô đầu tiên nằm " +
+        "dưới câu hỏi đó, B là ô thứ hai, C thứ ba, D thứ tư, theo thứ tự từ trên xuống; hãy NHÌN ẢNH CHỤP để đọc nội dung " +
+        "từng phương án A/B/C/D của câu, chọn phương án đúng rồi trả số [id] của ĐÚNG ô cùng thứ tự đó. Câu nào chưa có ô " +
+        "chọn nào hiện trên màn hình thì bỏ qua. KHÔNG được trả rỗng chỉ vì ô chọn không có chữ. " +
+        "Hỗ trợ MỌI dạng: đáp án có chữ A/B/C/D; chỉ có ô tròn/ô vuông không có chữ cái (không cần tự " +
         "thêm chữ A/B/C/D nếu đề không ghi); câu hỏi có thể được đóng khung bằng tiêu đề đánh số như '8. Chọn đáp " +
         "án đúng nhất' thay vì ghi 'Câu 8', các phương án nằm ngay sau nội dung câu hỏi đó cho tới tiêu đề câu kế " +
         "tiếp; nhiều câu hỏi CHƯA trả lời có thể hiện cùng lúc trên một màn hình (trả lời tất cả); dòng '---' là " +
@@ -264,7 +270,7 @@ object ClaudeClient {
             Regex("(?i)tính|giải|giá trị|rút gọn|phương trình|bằng bao nhiêu|diện tích|chu vi|thể tích").containsMatchIn(screenText)
         val search = hasInput && !mathy
         // Chế độ nhanh chỉ gửi ảnh khi có công thức; chế độ chính xác luôn gửi ảnh.
-        val needImg = !fast || screenText.contains("(công thức)") || screenText.contains("(cần xem ảnh")
+        val needImg = !fast || screenText.contains("(công thức)") || screenText.contains("xem ảnh")
         val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1000 else 0) } catch (e: Exception) { null }) else null
         val base = models ?: DEFAULT_MODELS
         // Cả hai chế độ đều ưu tiên Flash đầy đủ (Lite hay đoán sai bài toán); Lite chỉ là dự phòng khi lỗi/hết hạn mức.
