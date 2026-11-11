@@ -36,7 +36,7 @@ object ClaudeClient {
         "'(ô chọn B ...)', '(ô chọn C ...)', '(ô chọn D ...)' là ô tích chọn KHÔNG kèm chữ phương án: A là ô đầu tiên nằm " +
         "dưới câu hỏi đó, B là ô thứ hai, C thứ ba, D thứ tư, theo thứ tự từ trên xuống; hãy NHÌN ẢNH CHỤP để đọc nội dung " +
         "từng phương án A/B/C/D của câu, chọn phương án đúng rồi trả số [id] của ĐÚNG ô cùng thứ tự đó. Câu nào chưa có ô " +
-        "chọn nào hiện trên màn hình thì bỏ qua. KHÔNG được trả rỗng chỉ vì ô chọn không có chữ. " +
+        "chọn nào hiện trên màn hình thì bỏ qua. KHÔNG được trả rỗng chỉ vì ô chọn không có chữ. Chỉ trả lời câu mà trong ảnh thấy ĐỦ đề bài VÀ ĐỦ các phương án; câu bị cắt ở mép trên/dưới màn hình (thiếu một phần đề hoặc thiếu phương án) thì BỎ QUA để lần sau cuộn trang rồi làm (trừ khi câu dài hơn cả màn hình). " +
         "ẢNH CHỤP LÀ NGUỒN CHÍNH: hãy đọc câu hỏi và các phương án TRỰC TIẾP trong ảnh; danh sách chữ chỉ để biết số [id] " +
         "và vị trí của từng phần tử. Nếu ảnh và danh sách chữ khác nhau thì tin ảnh. Cuối mỗi dòng ô chọn có {x=..% y=..%} là " +
         "vị trí của ô trên màn hình (x: 0%=mép trái, 100%=mép phải; y: 0%=mép trên, 100%=mép dưới): ô nằm cùng hàng/cạnh phương " +
@@ -256,21 +256,30 @@ object ClaudeClient {
         return if (one != null) listOfNotNull(one.groupValues[1].toIntOrNull()) else emptyList()
     }
 
-    private val VISION_RULES = """Bạn là giáo viên Việt Nam đang làm bài trắc nghiệm. Ảnh là ảnh chụp màn hình điện thoại đang hiện một bài trắc nghiệm (thường trên trình duyệt, có thể có thanh địa chỉ, tiêu đề, nút điều hướng).
-NHIỆM VỤ: tìm MỌI câu hỏi trắc nghiệm đang hiện trên màn hình mà (a) thấy rõ ĐỦ nội dung câu hỏi và ĐỦ các phương án, (b) CHƯA có phương án nào được chọn (ô tròn/ô vuông còn rỗng; ô đã tô màu hoặc có dấu chọn nghĩa là đã làm, BỎ QUA câu đó). Câu bị cắt ở mép trên hoặc mép dưới màn hình (thiếu đề hoặc thiếu phương án) thì BỎ QUA, sẽ làm sau khi cuộn trang.
-Với mỗi câu cần làm: suy luận ngắn rồi chọn phương án đúng nhất (câu phủ định KHÔNG PHẢI/SAI/NGOẠI TRỪ thì chọn phương án không thỏa điều kiện; câu lý thuyết vẫn phải chọn phương án phù hợp NHẤT, không được bỏ trống).
-Trả về JSON dạng {"cau":[{"so":"số hoặc tiêu đề câu","tinh":"lý do cực ngắn","dap_an":"chữ cái hoặc thứ tự 1-4 của phương án đúng","x":số,"y":số}]}. x, y là TOẠ ĐỘ TÂM của ô tròn/ô vuông (hoặc dấu chọn) nằm ngay trước phương án đúng, đo trên ảnh và chuẩn hoá thành số nguyên 0..1000 (x: 0 = mép trái, 1000 = mép phải; y: 0 = mép trên, 1000 = mép dưới). Nếu phương án không có ô tròn thì lấy tâm dòng chữ của phương án đó. Phải nhìn kỹ để điểm nằm đúng phương án đã chọn, không lệch sang phương án bên trên/dưới.
-Chỉ liệt kê các câu cần chạm. Nếu không có câu nào thỏa điều kiện thì trả {"cau": []}. KHÔNG chạm các nút Kết thúc / Nộp bài / Tiếp theo / Xem lại."""
+    private val VISION_RULES = """Bạn là giáo viên Việt Nam đang làm bài trắc nghiệm trên điện thoại. Ảnh là ảnh chụp màn hình (thường là trang web, có thể có thanh địa chỉ hoặc nút điều hướng).
+QUY TẮC: CHỈ trả lời câu mà trong ảnh thấy ĐỦ cả đề bài (từ số thứ tự tới hết câu hỏi) VÀ ĐỦ TẤT CẢ phương án, và CHƯA có phương án nào được chọn (ô đã tô màu/có dấu chọn nghĩa là đã làm, BỎ QUA). Câu bị cắt ở mép trên hoặc mép dưới màn hình (thiếu một phần đề hoặc thiếu phương án) thì TUYỆT ĐỐI KHÔNG trả lời mà phải báo cần kéo trang (trường "cuon"). Ngoại lệ: câu dài hơn cả màn hình thì vẫn trả lời nếu đã thấy đủ phần cần thiết để quyết định.
+Với mỗi câu cần làm: ghi lý do RẤT NGẮN (tối đa 12 từ) rồi chọn đáp án đúng nhất (câu phủ định KHÔNG PHẢI/SAI/NGOẠI TRỪ thì chọn phương án không thỏa điều kiện; câu lý thuyết vẫn phải chọn phương án phù hợp NHẤT, không được bỏ trống).
+Trả về JSON {"cau":[{"so":"số hoặc tiêu đề câu","tinh":"lý do cực ngắn","dap_an":"chữ cái hoặc thứ tự 1-4","x":số,"y":số}],"cuon":số}.
+"cau": mỗi phần tử là một câu cần chạm. x, y là TOẠ ĐỘ TÂM của ô tròn/ô vuông (hoặc dấu chọn) nằm ngay trước phương án đúng, đo trên ảnh, chuẩn hoá thành số nguyên 0..1000 (x: 0 = mép trái, 1000 = mép phải; y: 0 = mép trên, 1000 = mép dưới). Nếu phương án không có ô tròn thì lấy tâm dòng chữ của phương án đó. Điểm phải nằm đúng phương án đã chọn, không lệch sang phương án bên trên/dưới. Nếu không có câu nào đủ điều kiện thì "cau": [].
+"cuon": số nguyên (đơn vị 0..1000 theo chiều CAO của ảnh) cho biết cần kéo trang bao nhiêu để câu CHƯA hiện đủ gần nhất hiện ra trọn vẹn. Số dương = kéo trang xuống (nội dung chạy lên), số âm = kéo ngược lên.
+ - Có câu chưa làm bị cắt ở mép TRÊN (thấy phương án nhưng mất một phần đề): cuon = -350. Nếu đồng thời còn câu bị cắt ở mép dưới thì ƯU TIÊN số âm này trước.
+ - Có câu chưa làm bị cắt ở mép DƯỚI (thiếu phương án), hoặc số thứ tự/tiêu đề của câu kế tiếp đang nằm ở nửa dưới màn hình: cuon = (y của dòng đầu tiên - số thứ tự hoặc tiêu đề - của câu đó) trừ 80, để đầu câu đó lên sát mép trên màn hình.
+ - Mọi câu đang hiện đã đủ và đã được làm hoặc đã chọn: cuon = 750.
+ - Đã thấy cuối trang (nút Kết thúc/Nộp bài, không còn câu nào bên dưới): cuon = 0.
+KHÔNG chạm các nút Kết thúc / Nộp bài / Tiếp theo / Xem lại."""
 
     private fun strProp() = JSONObject().put("type", "STRING")
     private fun intProp() = JSONObject().put("type", "INTEGER")
 
-    private fun visionBody(img: String, mode: Int): JSONObject {
+    // taps: các điểm cần chạm; cuon: AI đề nghị kéo trang bao nhiêu (đơn vị 0..1000 chiều cao màn hình, âm = kéo ngược lên).
+    data class VResult(val taps: List<VTap>, val cuon: Int)
+
+    private fun visionBody(img: String, mode: Int, fast: Boolean): JSONObject {
         val parts = JSONArray()
         parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", img)))
         parts.put(JSONObject().put("text", "Làm bài trắc nghiệm trong ảnh theo hướng dẫn."))
-        val gen = JSONObject().put("maxOutputTokens", 4096)
-        if (mode == 0) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", 1024))
+        val gen = JSONObject().put("maxOutputTokens", if (fast) 1500 else 4096)
+        if (mode == 0) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", if (fast) 0 else 1024))
         if (mode == 1) gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
         if (mode < 3) {
             val names = listOf("so", "tinh", "dap_an", "x", "y")
@@ -281,8 +290,11 @@ Chỉ liệt kê các câu cần chạm. Nếu không có câu nào thỏa đi�
                 .put("required", JSONArray(names))
             gen.put("responseMimeType", "application/json")
             gen.put("responseSchema", JSONObject().put("type", "OBJECT")
-                .put("properties", JSONObject().put("cau", JSONObject().put("type", "ARRAY").put("items", item)))
-                .put("required", JSONArray(listOf("cau"))))
+                .put("properties", JSONObject()
+                    .put("cau", JSONObject().put("type", "ARRAY").put("items", item))
+                    .put("cuon", intProp()))
+                .put("propertyOrdering", JSONArray(listOf("cau", "cuon")))
+                .put("required", JSONArray(listOf("cau", "cuon"))))
         }
         return JSONObject()
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", VISION_RULES))))
@@ -290,13 +302,16 @@ Chỉ liệt kê các câu cần chạm. Nếu không có câu nào thỏa đi�
             .put("generationConfig", gen)
     }
 
-    private fun parseVision(text: String): List<VTap> {
+    private fun parseVision(text: String): VResult {
         val out = ArrayList<VTap>()
+        var cuon = 0
         try {
             val a = text.indexOf('{')
             val b = text.lastIndexOf('}')
             if (a >= 0 && b > a) {
-                val arr = JSONObject(text.substring(a, b + 1)).optJSONArray("cau")
+                val root = JSONObject(text.substring(a, b + 1))
+                cuon = root.optInt("cuon", 0).coerceIn(-900, 900)
+                val arr = root.optJSONArray("cau")
                 if (arr != null) {
                     for (i in 0 until arr.length()) {
                         val o = arr.optJSONObject(i) ?: continue
@@ -310,13 +325,14 @@ Chỉ liệt kê các câu cần chạm. Nếu không có câu nào thỏa đi�
             }
         } catch (e: Exception) {
         }
-        return out.sortedBy { it.y }
+        return VResult(out.sortedBy { it.y }, cuon)
     }
 
     // CHẾ ĐỘ NHÌN ẢNH: dùng khi cây giao diện không đưa nội dung trang web (không có ô chọn để chạm theo [id]).
-    // AI đọc ảnh chụp, chọn đáp án và trả toạ độ ô cần chạm.
-    fun askVision(apiKey: String): List<VTap> {
-        val img = (try { CaptureService.grab(0) } catch (e: Exception) { null })
+    // AI đọc ảnh chụp, chỉ làm câu hiện ĐỦ đề và đủ phương án, trả toạ độ ô cần chạm và mức cần kéo trang.
+    fun askVision(apiKey: String, fast: Boolean): VResult {
+        // Ảnh nhỏ hơn (1024px, chất lượng 60) -> tải lên nhanh hơn rất nhiều trên mạng di động; chế độ chính xác dùng ảnh gốc.
+        val img = (try { CaptureService.grab(if (fast) 1024 else 0) } catch (e: Exception) { null })
             ?: throw RuntimeException(if (CaptureService.blackFrame) "Ảnh chụp bị đen (app chặn chụp màn hình)" else "Chưa có ảnh chụp màn hình (hãy bật 📷)")
         val base = models ?: DEFAULT_MODELS
         if (idx != 0 && System.currentTimeMillis() - switchedAt > 120000L) idx = 0
@@ -324,17 +340,17 @@ Chỉ liệt kê các câu cần chạm. Nếu không có câu nào thỏa đi�
         var tries = 0
         while (tries < base.size) {
             val m = base[idx % base.size]
-            val mk = "$m|vision"
+            val mk = "$m|vision|$fast"
             var mode = modeOf[mk] ?: 0
-            var r = post(apiKey, m, visionBody(img, mode), false)
+            var r = post(apiKey, m, visionBody(img, mode, fast), fast)
             while (r.first == 400 && mode < 3 && !r.second.contains("API key", ignoreCase = true)) {
                 mode++
-                r = post(apiKey, m, visionBody(img, mode), false)
+                r = post(apiKey, m, visionBody(img, mode, fast), fast)
             }
             if (r.first in 200..299) {
                 if (mode < 3) modeOf[mk] = mode
                 val text = replyText(r.second)
-                lastInfo = "Model: $m | CHẾ ĐỘ NHÌN ẢNH | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
+                lastInfo = "Model: $m | CHẾ ĐỘ NHÌN ẢNH | Nhanh: $fast | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
                 return parseVision(text)
             }
             lastErr = "HTTP ${r.first} ($m): ${r.second.take(120)}"
@@ -375,7 +391,7 @@ Chỉ liệt kê các câu cần chạm. Nếu không có câu nào thỏa đi�
         val search = hasInput && !mathy
         // Chế độ nhanh chỉ gửi ảnh khi có công thức; chế độ chính xác luôn gửi ảnh.
         val needImg = alwaysImg || !fast || screenText.contains("(công thức)") || screenText.contains("xem ảnh")
-        val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1280 else 0) } catch (e: Exception) { null }) else null
+        val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1024 else 0) } catch (e: Exception) { null }) else null
         val base = models ?: DEFAULT_MODELS
         // Cả hai chế độ đều ưu tiên Flash đầy đủ (Lite hay đoán sai bài toán); Lite chỉ là dự phòng khi lỗi/hết hạn mức.
         val list = base
