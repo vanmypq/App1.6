@@ -26,8 +26,8 @@ class MainActivity : Activity() {
                 "3) Bấm \"Bật dịch vụ Trợ năng\", tìm \"Auto Trắc Nghiệm\" và bật.\n" +
                 "4) Mở app/web có câu trắc nghiệm, bấm nút nổi \"▶ AI\" để bật chế độ tự chọn; bấm lại để tắt. " +
                 "Tự nhận mọi dạng: A/B/C/D, chỉ có ô tích chọn, nhiều đáp án đúng, Đúng/Sai, nhiều câu cùng màn hình. " +
-                "v1.6: tự cuộn tìm câu mới, tự bấm Kiểm tra/Tiếp theo, nhập đúng ô trả lời ngắn; tới nút Nộp bài thì dừng để bạn tự bấm. " +
-                "Nhấn giữ nút nổi để sao chép dữ liệu app đọc được.\n\n" +
+                "Nhấn giữ nút nổi để sao chép dữ liệu app đọc được.\n" +
+                "v1.9: tự cuộn trang tìm câu mới, tự bấm nút Tiếp theo để qua trang.\n\n" +
                 "Chỉ dùng để ôn tập, luyện đề. Không dùng trong bài kiểm tra/thi thật."
             textSize = 15f
         })
@@ -49,11 +49,17 @@ class MainActivity : Activity() {
             isChecked = prefs.getBoolean("fast", true)
             setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("fast", c).apply() }
         })
-        root.addView(CheckBox(this).apply {
-            text = "Tự cuộn trang + tự bấm chuyển câu (chạy hết bài, KHÔNG tự nộp bài)"
-            isChecked = prefs.getBoolean("advance", true)
-            setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("advance", c).apply() }
-        })
+        fun opt(label: String, k: String, def: Boolean) {
+            root.addView(CheckBox(this).apply {
+                text = label
+                isChecked = prefs.getBoolean(k, def)
+                setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(k, c).apply() }
+            })
+        }
+        opt("Tự cuộn trang xuống tìm câu hỏi mới (khi đã làm xong các câu đang hiện)", "scroll", true)
+        opt("Tự bấm nút Tiếp theo / Câu sau / Trang sau khi đã hết trang", "next", true)
+        opt("Nếu không có nút: vuốt ngang để qua trang (cho app dạng trượt)", "swipe", false)
+        opt("Tự bấm Nộp bài / Kết thúc khi hết câu (mặc định TẮT)", "submit", false)
         root.addView(Button(this).apply {
             text = "Cấp quyền chụp màn hình"
             setOnClickListener {
