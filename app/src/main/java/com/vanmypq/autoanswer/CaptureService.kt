@@ -26,44 +26,94 @@ class CaptureService : Service() {
     companion object {
         @Volatile private var reader: ImageReader? = null
         @Volatile private var cached: String? = null
+        @Volatile private var cachedTs = 0L
+        @Volatile private var cachedSide = -1
+        @Volatile private var latest: android.media.Image? = null
+        @Volatile private var frameTs = 0L
+        private val lock = Any()
         @Volatile private var w = 0
         @Volatile private var h = 0
         @Volatile var lastError: String = ""
+        // true khi ảnh chụp gần như đen hoàn toàn (ứng dụng chặn chụp màn hình - FLAG_SECURE).
+        @Volatile var blackFrame: Boolean = false
 
         fun isRunning(): Boolean = reader != null
 
-        // Trả về ảnh màn hình hiện tại dạng JPEG base64, hoặc null nếu chưa cấp quyền.
-        @Synchronized
-        fun grab(maxSide: Int = 0): String? {
-            val r = reader ?: return null
-            var image: android.media.Image? = null
-            try {
-                image = r.acquireLatestImage()
-            } catch (e: Exception) {
+        // Luôn giữ lại KHUNG HÌNH MỚI NHẤT mà hệ thống gửi tới, để lúc cần chụp là có đúng màn hình hiện tại
+        // (trước đây nếu màn hình đứng yên có thể trả về ảnh cũ).
+        private fun keepLatest(r: ImageReader) {
+            val img = try { r.acquireLatestImage() } catch (e: Exception) { null } ?: return
+            synchronized(lock) {
+                try { latest?.close() } catch (e: Exception) { }
+                latest = img
+                frameTs = android.os.SystemClock.uptimeMillis()
             }
-            if (image != null) {
-                try {
-                    val plane = image.planes[0]
-                    val pixelStride = plane.pixelStride
-                    val rowStride = plane.rowStride
-                    val rowPadding = rowStride - pixelStride * w
-                    val bmp = Bitmap.createBitmap(w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888)
-                    bmp.copyPixelsFromBuffer(plane.buffer)
-                    val cropped = Bitmap.createBitmap(bmp, 0, 0, w, h)
-                    val bos = ByteArrayOutputStream()
-                    var out = cropped
-                    if (maxSide > 0 && maxOf(w, h) > maxSide) {
-                        val sc = maxSide.toFloat() / maxOf(w, h)
-                        out = Bitmap.createScaledBitmap(cropped, (w * sc).toInt(), (h * sc).toInt(), true)
-                    }
-                    out.compress(Bitmap.CompressFormat.JPEG, if (maxSide > 0) 55 else 65, bos)
-                    cached = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
-                } catch (e: Exception) {
-                } finally {
-                    image.close()
+        }
+
+        private fun isBlack(b: Bitmap): Boolean {
+            val sx = maxOf(1, b.width / 24)
+            val sy = maxOf(1, b.height / 48)
+            var y = (b.height * 0.08f).toInt()
+            val yEnd = (b.height * 0.92f).toInt()
+            while (y < yEnd) {
+                var x = 0
+                while (x < b.width) {
+                    val c = b.getPixel(x, y)
+                    val lum = (android.graphics.Color.red(c) + android.graphics.Color.green(c) + android.graphics.Color.blue(c)) / 3
+                    if (lum > 12) return false
+                    x += sx
                 }
+                y += sy
             }
-            return cached
+            return true
+        }
+
+        // Trả về ảnh màn hình hiện tại dạng JPEG base64, hoặc null nếu chưa cấp quyền / ảnh bị đen (app chặn chụp).
+        fun grab(maxSide: Int = 0): String? {
+            if (reader == null) return null
+            return synchronized(lock) {
+                val image = latest
+                if (image != null && (frameTs != cachedTs || cachedSide != maxSide)) {
+                    try {
+                        val plane = image.planes[0]
+                        plane.buffer.rewind()
+                        val pixelStride = plane.pixelStride
+                        val rowStride = plane.rowStride
+                        val rowPadding = rowStride - pixelStride * w
+                        val bmp = Bitmap.createBitmap(w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888)
+                        bmp.copyPixelsFromBuffer(plane.buffer)
+                        val cropped = Bitmap.createBitmap(bmp, 0, 0, w, h)
+                        blackFrame = isBlack(cropped)
+                        if (blackFrame) {
+                            cached = null
+                        } else {
+                            var out = cropped
+                            if (maxSide > 0 && maxOf(w, h) > maxSide) {
+                                val sc = maxSide.toFloat() / maxOf(w, h)
+                                out = Bitmap.createScaledBitmap(cropped, (w * sc).toInt(), (h * sc).toInt(), true)
+                            }
+                            val bos = ByteArrayOutputStream()
+                            out.compress(Bitmap.CompressFormat.JPEG, if (maxSide > 0) 60 else 72, bos)
+                            cached = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+                        }
+                        cachedTs = frameTs
+                        cachedSide = maxSide
+                    } catch (e: Exception) {
+                    }
+                }
+                cached
+            }
+        }
+
+        internal fun clearFrames() {
+            synchronized(lock) {
+                try { latest?.close() } catch (e: Exception) { }
+                latest = null
+                cached = null
+                cachedTs = 0L
+                cachedSide = -1
+                blackFrame = false
+            }
         }
     }
 
@@ -105,10 +155,11 @@ class CaptureService : Service() {
             val real = DisplayMetrics()
             @Suppress("DEPRECATION")
             (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(real)
-            val scale = 1280f / maxOf(real.widthPixels, real.heightPixels)
+            val scale = minOf(1f, 1600f / maxOf(real.widthPixels, real.heightPixels))
             w = (real.widthPixels * scale).toInt()
             h = (real.heightPixels * scale).toInt()
-            val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+            val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
+            r.setOnImageAvailableListener({ rd -> keepLatest(rd) }, Handler(Looper.getMainLooper()))
             display = mp.createVirtualDisplay(
                 "autoanswer-cap", w, h, real.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null
@@ -132,7 +183,7 @@ class CaptureService : Service() {
         } catch (e: Exception) {
         }
         reader = null
-        cached = null
+        clearFrames()
         try {
             projection?.stop()
         } catch (e: Exception) {
