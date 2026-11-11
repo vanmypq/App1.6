@@ -56,6 +56,7 @@ class MainActivity : Activity() {
                 setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(k, c).apply() }
             })
         }
+        opt("Luôn gửi ảnh chụp màn hình cho AI để nhận diện câu hỏi (chính xác hơn, cần cấp quyền chụp màn hình)", "img", true)
         opt("Tự cuộn trang xuống tìm câu hỏi mới (khi đã làm xong các câu đang hiện)", "scroll", true)
         opt("Tự bấm nút Tiếp theo / Câu sau / Trang sau khi đã hết trang", "next", true)
         opt("Nếu không có nút: vuốt ngang để qua trang (cho app dạng trượt)", "swipe", false)
