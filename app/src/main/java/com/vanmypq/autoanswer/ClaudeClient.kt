@@ -33,6 +33,10 @@ object ClaudeClient {
         "dưới câu hỏi đó, B là ô thứ hai, C thứ ba, D thứ tư, theo thứ tự từ trên xuống; hãy NHÌN ẢNH CHỤP để đọc nội dung " +
         "từng phương án A/B/C/D của câu, chọn phương án đúng rồi trả số [id] của ĐÚNG ô cùng thứ tự đó. Câu nào chưa có ô " +
         "chọn nào hiện trên màn hình thì bỏ qua. KHÔNG được trả rỗng chỉ vì ô chọn không có chữ. " +
+        "ẢNH CHỤP LÀ NGUỒN CHÍNH: hãy đọc câu hỏi và các phương án TRỰC TIẾP trong ảnh; danh sách chữ chỉ để biết số [id] " +
+        "và vị trí của từng phần tử. Nếu ảnh và danh sách chữ khác nhau thì tin ảnh. Cuối mỗi dòng ô chọn có {x=..% y=..%} là " +
+        "vị trí của ô trên màn hình (x: 0%=mép trái, 100%=mép phải; y: 0%=mép trên, 100%=mép dưới): ô nằm cùng hàng/cạnh phương " +
+        "án nào trong ảnh thì là ô của phương án đó. Đọc kỹ cả đề lẫn phương án trong ảnh trước khi quyết định. " +
         "Hỗ trợ MỌI dạng: đáp án có chữ A/B/C/D; chỉ có ô tròn/ô vuông không có chữ cái (không cần tự " +
         "thêm chữ A/B/C/D nếu đề không ghi); câu hỏi có thể được đóng khung bằng tiêu đề đánh số như '8. Chọn đáp " +
         "án đúng nhất' thay vì ghi 'Câu 8', các phương án nằm ngay sau nội dung câu hỏi đó cho tới tiêu đề câu kế " +
@@ -160,8 +164,8 @@ object ClaudeClient {
         try {
             val c = URL("$BASE/models/$m:generateContent").openConnection() as HttpURLConnection
             c.requestMethod = "POST"
-            c.connectTimeout = 5000
-            c.readTimeout = if (fast) 10000 else 30000
+            c.connectTimeout = 6000
+            c.readTimeout = if (fast) 20000 else 40000
             c.doOutput = true
             c.setRequestProperty("Content-Type", "application/json")
             c.setRequestProperty("x-goog-api-key", apiKey)
@@ -264,18 +268,18 @@ object ClaudeClient {
         }
     }
 
-    fun ask(apiKey: String, screenText: String, fast: Boolean, hasInput: Boolean = false): Answer {
+    fun ask(apiKey: String, screenText: String, fast: Boolean, hasInput: Boolean = false, alwaysImg: Boolean = true): Answer {
         // Có ô nhập: câu tính toán/công thức -> tự tính (nhanh, không cần tra cứu); câu kiến thức/pháp luật -> tra Google Search.
         val mathy = screenText.contains("(công thức)") ||
             Regex("(?i)tính|giải|giá trị|rút gọn|phương trình|bằng bao nhiêu|diện tích|chu vi|thể tích").containsMatchIn(screenText)
         val search = hasInput && !mathy
         // Chế độ nhanh chỉ gửi ảnh khi có công thức; chế độ chính xác luôn gửi ảnh.
-        val needImg = !fast || screenText.contains("(công thức)") || screenText.contains("xem ảnh")
-        val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1000 else 0) } catch (e: Exception) { null }) else null
+        val needImg = alwaysImg || !fast || screenText.contains("(công thức)") || screenText.contains("xem ảnh")
+        val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1280 else 0) } catch (e: Exception) { null }) else null
         val base = models ?: DEFAULT_MODELS
         // Cả hai chế độ đều ưu tiên Flash đầy đủ (Lite hay đoán sai bài toán); Lite chỉ là dự phòng khi lỗi/hết hạn mức.
         val list = base
-        if (idx != 0 && System.currentTimeMillis() - switchedAt > 300000L) idx = 0
+        if (idx != 0 && System.currentTimeMillis() - switchedAt > 120000L) idx = 0
         var lastErr = "không có model"
         var tries = 0
         while (tries < list.size) {
