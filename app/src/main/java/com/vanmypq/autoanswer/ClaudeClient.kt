@@ -47,7 +47,10 @@ object ClaudeClient {
         "gần ô nhập hoặc ở cuối màn hình. "
     private const val FAST_TAIL = "Trả về JSON gồm 2 trường theo thứ tự: \"tinh\" (tính nhẩm/đối chiếu CỰC NGẮN, tối đa 30 từ: " +
         "với bài tính toán phải tính ra kết quả, với bài lý thuyết nêu công thức/định nghĩa đúng rồi so từng phương án) " +
-        "và \"ids\". Phải điền \"tinh\" trước rồi mới chọn \"ids\" theo kết quả đó."
+        "và \"ids\". Phải điền \"tinh\" trước rồi mới chọn \"ids\" theo kết quả đó. Nếu có NHIỀU câu hỏi cùng lúc, " +
+        "\"tinh\" chỉ cần 1 cụm rất ngắn mỗi câu, và \"ids\" phải gồm ĐỦ đáp án của TẤT CẢ câu còn thiếu; câu nào " +
+        "chưa có dòng kết quả/hướng dẫn của riêng nó thì vẫn phải trả lời, đừng bỏ qua chỉ vì câu khác gần đó đã " +
+        "có kết quả."
     private const val INPUT_TAIL = "Màn hình có ô nhập chữ (✎). DÙNG Google Search để tìm đáp án chính xác nhất " +
         "(ưu tiên văn bản pháp luật/nguồn chính thống/sách giáo khoa). Chỉ điền ĐÚNG từ/cụm từ cần điền, ngắn gọn, " +
         "đúng nguyên văn, KHÔNG giải thích, KHÔNG dấu chấm cuối; bỏ qua '(...)' nằm trong câu lệnh \"điền từ thích hợp\". " +
@@ -59,7 +62,12 @@ object ClaudeClient {
         "Chỉ ghi ĐÁP SỐ trong \"text\" (số, hoặc chữ ngắn), KHÔNG kèm đơn vị nếu bên cạnh ô đã có sẵn đơn vị, " +
         "tuân thủ giới hạn ký tự/định dạng ghi trong đề (dấu thập phân, làm tròn...). Không có đáp án trắc nghiệm thì \"ids\" để rỗng."
     private const val SLOW_TAIL = "Kiểm tra TỪNG phương án (chú ý bẫy hệ số bằng 0, số mũ, mẫu số chứa ẩn), " +
-        "chỉ ghi phân tích ngắn gọn tối đa 6 dòng rồi mới in JSON."
+        "chỉ ghi phân tích ngắn gọn tối đa 6 dòng rồi mới in JSON. Nếu màn hình có NHIỀU câu hỏi cùng lúc, chỉ " +
+        "phân tích 1 dòng cực ngắn cho MỖI câu (không phân tích dài từng câu), ưu tiên liệt kê ĐỦ ids/nhap của " +
+        "TẤT CẢ câu còn thiếu hơn là viết giải thích dài dòng. Câu nào CHƯA có dòng kết quả/hướng dẫn riêng của " +
+        "NÓ thì vẫn là câu CHƯA làm, phải trả lời bình thường, kể cả khi câu khác ở gần đó đã có kết quả. Nếu đề " +
+        "có đoạn văn/ngữ cảnh dài (đọc hiểu, tình huống), đọc kỹ TOÀN BỘ đoạn trước khi chọn, đừng chỉ dựa vào " +
+        "vài dòng cuối hay tiêu đề."
 
     private fun loadModels(apiKey: String): List<String> {
         models?.let { return it }
@@ -121,7 +129,7 @@ object ClaudeClient {
             parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", img)))
         }
         parts.put(JSONObject().put("text", screenText))
-        val gen = JSONObject().put("maxOutputTokens", if (search || !fast) 4096 else 1024)
+        val gen = JSONObject().put("maxOutputTokens", if (search || !fast) 8192 else 1024)
         if (mode == 0) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", if (search) (if (fast) 512 else 1024) else if (fast) 0 else 1024))
         if (mode == 1) gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
         if (fast && !search && mode < 3) {
@@ -215,6 +223,20 @@ object ClaudeClient {
         val arr = Regex("\"ids\"\\s*:\\s*\\[([^\\]]*)\\]").findAll(text).lastOrNull()
         if (arr != null) {
             return Regex("\\d+").findAll(arr.groupValues[1]).mapNotNull { it.value.toIntOrNull() }.toList()
+        }
+        // Màn hình có nhiều câu đôi khi làm câu trả lời bị CẮT GIỮA CHỪNG (hết hạn mức token) nên mảng
+        // "ids" không có dấu ']' đóng. Vẫn lấy các số đã kịp sinh ra thay vì bỏ hết, để không mất trắng
+        // các câu đã được AI chọn xong trước khi bị cắt.
+        val cutIdx = text.lastIndexOf("\"ids\"")
+        if (cutIdx >= 0) {
+            val open = text.indexOf('[', cutIdx)
+            if (open >= 0) {
+                val tail = text.substring(open + 1)
+                val stop = tail.indexOfFirst { it == '"' }
+                val segment = if (stop >= 0) tail.substring(0, stop) else tail
+                val nums = Regex("\\d+").findAll(segment).mapNotNull { it.value.toIntOrNull() }.toList()
+                if (nums.isNotEmpty()) return nums
+            }
         }
         val one = Regex("\"id\"\\s*:\\s*(\\d+)").findAll(text).lastOrNull()
         return if (one != null) listOfNotNull(one.groupValues[1].toIntOrNull()) else emptyList()
