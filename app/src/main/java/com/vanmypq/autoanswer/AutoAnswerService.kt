@@ -95,13 +95,13 @@ class AutoAnswerService : AccessibilityService() {
         override fun run() {
             if (!auto) return
             tick()
-            handler.postDelayed(this, 200)
+            handler.postDelayed(this, 150)
         }
     }
 
     private val eventTick = Runnable {
         tick()
-        handler.postDelayed({ tick() }, 90)
+        handler.postDelayed({ tick() }, 60)
     }
 
     override fun onServiceConnected() {
@@ -259,7 +259,7 @@ class AutoAnswerService : AccessibilityService() {
                         val hint = n.hintText?.toString()?.trim() ?: ""
                         out.add(Item("(ô nhập)" + (if (hint.isNotEmpty()) " " + hint.take(40) else ""), r, n, false, false, true))
                     } else if (!t.isNullOrEmpty()) {
-                        out.add(Item(t.take(400), r, n, choice, choice && n.isChecked))
+                        out.add(Item(t.take(1200), r, n, choice, choice && n.isChecked))
                     } else if (choice || looksLikeIconButton(n, r)) {
                         out.add(Item("", r, n, true, choice && n.isChecked))
                     }
@@ -269,7 +269,7 @@ class AutoAnswerService : AccessibilityService() {
                 // Nút ẩn nằm trong nút đang hiện (ví dụ công thức KaTeX/MathML): lấy chữ, chạm vào vùng của nút cha.
                 val t = gather(n, 0).trim()
                 if (t.isNotEmpty() && !parentRect.isEmpty) {
-                    out.add(Item("(công thức) " + t.take(300), Rect(parentRect), n))
+                    out.add(Item("(công thức) " + t.take(800), Rect(parentRect), n))
                 }
             }
         }
@@ -361,12 +361,14 @@ class AutoAnswerService : AccessibilityService() {
         busy = true
         val fast = getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("fast", true)
         val hasInput = items.any { it.input }
-        setStatus(if (hasInput) "AI đang điền…" else if (fast) "AI nhanh…" else "AI đang suy nghĩ…")
+        val longText0 = text.length > 900
+        setStatus(if (hasInput) "AI đang điền…" else if (longText0) "câu dài, đọc kỹ…" else if (fast) "AI nhanh…" else "AI đang suy nghĩ…")
         lastSent = text
         exec.execute {
             var got = ClaudeClient.Answer(emptyList(), emptyMap())
             var gotErr: String? = null
-            val effFast = fast && !slowHashes.contains(h)
+            // Câu hỏi dài (đọc hiểu, tình huống dài...) cần đọc kỹ: tự chuyển chế độ chính xác dù đang bật NHANH.
+            val effFast = fast && !slowHashes.contains(h) && !longText0
             try {
                 got = ClaudeClient.ask(key, text, effFast, hasInput)
             } catch (e: Exception) {
@@ -464,7 +466,10 @@ class AutoAnswerService : AccessibilityService() {
                 run.add(i)
             } else {
                 flush()
-                if (!item.ctrl && !item.input && sb.isNotEmpty() && headerRe.containsMatchIn(t.trim())) sb.append("---\n")
+                // Chỉ chèn vạch khi đây là một dòng tiêu đề NGẮN đứng riêng (vd "8. Chọn đáp án đúng nhất"),
+                // không chèn giữa đoạn hướng dẫn/giải thích dài lỡ bắt đầu bằng số thứ tự.
+                if (!item.ctrl && !item.input && sb.isNotEmpty() && t.trim().length <= 60 &&
+                    headerRe.containsMatchIn(t.trim())) sb.append("---\n")
                 if (item.ctrl) sb.append("[${i + 1}] ").append(if (item.checked) "☑ " else "☐ ").append(t).append('\n')
                 else if (item.input) sb.append("[${i + 1}] ✎ ")
                     .append(if (item.maxLen > 0) "(tối đa ${item.maxLen} ký tự) " else "").append(t).append('\n')
@@ -484,16 +489,22 @@ class AutoAnswerService : AccessibilityService() {
         list.joinToString("|") { key(it.text) + it.rect.flattenToString() }.hashCode()
 
     // Lấy lại tọa độ mới nhất của đáp án (trang có thể đã dịch chuyển trong lúc chờ AI).
+    // Lấy lại đáp án đúng ô: ưu tiên node cũ nếu nội dung còn khớp (tránh trường hợp view bị tái dùng
+    // cho câu khác làm chạm nhầm); nếu không, tìm theo chữ TRÙNG VÀ GẦN VỊ TRÍ CŨ NHẤT thay vì đếm theo
+    // thứ tự xuất hiện — vì màn hình có câu đã trả lời trước đó chèn thêm chữ (vd "Đáp án đúng là B")
+    // làm lệch thứ tự đếm, dễ chạm sai sang đáp án của câu khác có cùng chữ (A/B/C/D...).
     private fun resolve(item: Item, occurrence: Int): Item {
         val n = item.node
         if (n != null && n.refresh()) {
             val r = Rect()
             n.getBoundsInScreen(r)
-            if (!r.isEmpty && n.isVisibleToUser) return item.copy(rect = r)
+            val stillMatches = item.text.isEmpty() || (n.text ?: n.contentDescription)?.toString()?.trim() == item.text
+            if (!r.isEmpty && n.isVisibleToUser && stillMatches) return item.copy(rect = r)
         }
         val fresh = collect().filter { it.text == item.text }
-        if (fresh.size > occurrence) return fresh[occurrence]
-        return item
+        if (fresh.isEmpty()) return item
+        val nearest = fresh.minByOrNull { abs(it.rect.top - item.rect.top) + abs(it.rect.left - item.rect.left) }
+        return nearest ?: (if (fresh.size > occurrence) fresh[occurrence] else item)
     }
 
     // Gõ chữ vào ô nhập: SET_TEXT trước, nếu app/web không nhận thì dán qua clipboard.
@@ -526,13 +537,13 @@ class AutoAnswerService : AccessibilityService() {
         tapStart = SystemClock.uptimeMillis()
         if (index >= acts.size) {
             tapping = false
-            cooldownUntil = SystemClock.uptimeMillis() + 500
+            cooldownUntil = SystemClock.uptimeMillis() + 350
             afterTap()
             return
         }
         val act = acts[index]
         val cur = resolve(act.item, act.occ)
-        val next = { handler.postDelayed({ chooseAll(acts, index + 1) }, 30) }
+        val next = { handler.postDelayed({ chooseAll(acts, index + 1) }, 20) }
         if (act.text != null) {
             val limited = if (cur.maxLen > 0) act.text.take(cur.maxLen) else act.text
             if (!typeInto(cur.node, limited)) toast("Không gõ được vào ô nhập (ứng dụng chặn)")
@@ -563,7 +574,7 @@ class AutoAnswerService : AccessibilityService() {
             lastHash = h2
             currentHash = h2
             layoutHash = layoutOf(items2)
-        }, 250)
+        }, 180)
     }
 
     private fun clickNode(n: AccessibilityNodeInfo?) {
@@ -589,7 +600,7 @@ class AutoAnswerService : AccessibilityService() {
         val y = r.exactCenterY().coerceIn(2f, dm.heightPixels - 2f)
         val p = Path().apply { moveTo(x, y) }
         val g = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(p, 0, 30)).build()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, 20)).build()
         val ok = dispatchGesture(g, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) { onDone(true) }
             override fun onCancelled(gestureDescription: GestureDescription?) { onDone(false) }
@@ -601,7 +612,7 @@ class AutoAnswerService : AccessibilityService() {
         if (!auto || event == null) return
         if (event.packageName?.toString() == packageName) return
         handler.removeCallbacks(eventTick)
-        handler.postDelayed(eventTick, 60)
+        handler.postDelayed(eventTick, 40)
     }
     override fun onInterrupt() {}
     override fun onDestroy() {
