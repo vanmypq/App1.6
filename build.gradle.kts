@@ -1,4 +1,23 @@
 plugins {
-    id("com.android.application") version "8.5.2" apply false
-    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+android {
+    namespace = "com.vanmypq.autoanswer"
+    compileSdk = 34
+    defaultConfig {
+        applicationId = "com.vanmypq.autoanswer"
+        minSdk = 29
+        targetSdk = 34
+        versionCode = 10
+        versionName = "1.9"
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+dependencies {
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 }
