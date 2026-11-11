@@ -97,6 +97,7 @@ class AutoAnswerService : AccessibilityService() {
     private var navSame = 0
     private var swipeFromSig = 0
     private var finished = false
+    private var warnedBlack = false
     private val navLog = ArrayList<String>()
     private fun navNote(m: String) { navLog.add(m); if (navLog.size > 12) navLog.removeAt(0) }
 
@@ -670,7 +671,8 @@ class AutoAnswerService : AccessibilityService() {
         busy = true
         val fast = getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("fast", true)
         val hasInput = items.any { it.input }
-        val longText0 = text.length > 900
+        val alwaysImg = cfg().getBoolean("img", true)
+        val longText0 = text.length > 1300
         setStatus(if (hasInput) "AI đang điền…" else if (longText0) "câu dài, đọc kỹ…" else if (fast) "AI nhanh…" else "AI đang suy nghĩ…")
         lastSent = text
         exec.execute {
@@ -679,7 +681,7 @@ class AutoAnswerService : AccessibilityService() {
             // Câu hỏi dài (đọc hiểu, tình huống dài...) cần đọc kỹ: tự chuyển chế độ chính xác dù đang bật NHANH.
             val effFast = fast && !slowHashes.contains(h) && !longText0
             try {
-                got = ClaudeClient.ask(key, text, effFast, hasInput)
+                got = ClaudeClient.ask(key, text, effFast, hasInput, alwaysImg)
             } catch (e: Exception) {
                 gotErr = e.message ?: "lỗi mạng"
             }
@@ -688,6 +690,10 @@ class AutoAnswerService : AccessibilityService() {
             handler.post {
                 busy = false
                 markActive()
+                if (alwaysImg && hasImg && CaptureService.blackFrame && !warnedBlack) {
+                    warnedBlack = true
+                    toast("Ảnh chụp bị ĐEN: app này chặn chụp màn hình, AI chỉ đọc được chữ nên có thể kém chính xác")
+                }
                 if (err != null) {
                     lastHash = 0
                     val wait = if (err.contains("429")) 30000L else 6000L
@@ -752,6 +758,14 @@ class AutoAnswerService : AccessibilityService() {
     // lẫn phương án của câu này sang câu khác khi nhiều câu hiện cùng lúc trên một màn hình.
     private val headerRe = Regex("(?i)^(câu\\s*\\d+\\b|\\d{1,3}[.)])")
 
+    // Vị trí tương đối của phần tử trên màn hình (%), để AI đối chiếu ô chọn với phương án trong ảnh chụp.
+    private fun posTag(r: Rect): String {
+        val dm = resources.displayMetrics
+        val x = (r.exactCenterX() * 100f / dm.widthPixels).toInt().coerceIn(0, 100)
+        val y = (r.exactCenterY() * 100f / dm.heightPixels).toInt().coerceIn(0, 100)
+        return "{x=$x% y=$y%}"
+    }
+
     private fun buildPrompt(items: List<Item>): String {
         val sb = StringBuilder()
         val run = ArrayList<Int>()
@@ -781,9 +795,11 @@ class AutoAnswerService : AccessibilityService() {
                 val tt = t.removePrefix("(chữ ẩn) ").removePrefix("(công thức) ").trim()
                 if (!item.ctrl && !item.input && sb.isNotEmpty() &&
                     ((tt.length <= 60 && headerRe.containsMatchIn(tt)) || questionStartRe.containsMatchIn(tt))) sb.append("---\n")
-                if (item.ctrl) sb.append("[${i + 1}] ").append(if (item.checked) "☑ " else "☐ ").append(t).append('\n')
+                if (item.ctrl) sb.append("[${i + 1}] ").append(if (item.checked) "☑ " else "☐ ").append(t)
+                    .append(" ").append(posTag(item.rect)).append('\n')
                 else if (item.input) sb.append("[${i + 1}] ✎ ")
-                    .append(if (item.maxLen > 0) "(tối đa ${item.maxLen} ký tự) " else "").append(t).append('\n')
+                    .append(if (item.maxLen > 0) "(tối đa ${item.maxLen} ký tự) " else "").append(t)
+                    .append(" ").append(posTag(item.rect)).append('\n')
                 else sb.append("[${i + 1}] ").append(t).append('\n')
             }
         }
@@ -874,8 +890,22 @@ class AutoAnswerService : AccessibilityService() {
         }
         tap(cur.rect) { ok ->
             if (!ok) clickNode(cur.node)
+            verifyRadio(cur.node)
             next()
         }
+    }
+
+    // Nút radio chỉ có thể được CHỌN (không bị bỏ chọn khi bấm lại) nên nếu sau khi chạm vẫn chưa tích thì bấm thêm một lần.
+    private fun verifyRadio(n: AccessibilityNodeInfo?) {
+        if (n == null) return
+        val cn = n.className?.toString() ?: ""
+        if (!cn.contains("RadioButton")) return
+        handler.postDelayed({
+            try {
+                if (n.refresh() && n.isVisibleToUser && n.isCheckable && !n.isChecked) clickNode(n)
+            } catch (e: Exception) {
+            }
+        }, 350)
     }
 
     // Sau khi chạm, coi màn hình hiện tại (có thể có lời giải/đáp án đúng) là "đã xem" để không hỏi lại.
