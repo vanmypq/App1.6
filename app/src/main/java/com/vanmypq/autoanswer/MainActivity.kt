@@ -57,6 +57,7 @@ class MainActivity : Activity() {
             })
         }
         opt("Luôn gửi ảnh chụp màn hình cho AI để nhận diện câu hỏi (chính xác hơn, cần cấp quyền chụp màn hình)", "img", true)
+        opt("Tôi tự cuộn trang: AI đọc và chạm ngay câu đang hiện mỗi khi tôi dừng cuộn (app KHÔNG tự cuộn / tự qua trang)", "follow", false)
         opt("Tự cuộn trang xuống tìm câu hỏi mới (khi đã làm xong các câu đang hiện)", "scroll", true)
         opt("Tự bấm nút Tiếp theo / Câu sau / Trang sau khi đã hết trang", "next", true)
         opt("Nếu không có nút: vuốt ngang để qua trang (cho app dạng trượt)", "swipe", false)
