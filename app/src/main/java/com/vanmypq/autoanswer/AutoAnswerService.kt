@@ -99,6 +99,10 @@ class AutoAnswerService : AccessibilityService() {
     private var finished = false
     private var warnedBlack = false
     private var nextScrollUnits = 0      // mức kéo trang do AI/ước tính đề nghị cho lần cuộn kế (0..1000 theo chiều cao, âm = kéo lên)
+    private var visionPending = false    // lần nhìn ảnh gần nhất còn câu chưa làm
+    private var visionRetry = 0
+    private var finishTries = 0
+    private var lastErrToast = 0L
     private var upCount = 0             // số lần liên tiếp phải kéo ngược lên (chống lặp lên-xuống khi câu dài hơn màn hình)
     private var fastAdvance = false      // vừa chạm đáp án xong -> cuộn ngay, không chờ thêm
     private val visionHashes = HashSet<Int>()
@@ -124,8 +128,9 @@ class AutoAnswerService : AccessibilityService() {
         if (!visionAllowed()) return false
         if (items.any { it.ctrl || optionRe.containsMatchIn(it.text.removePrefix("(chữ ẩn) ")) ||
                 it.text.trim() == "Đúng" || it.text.trim() == "Sai" }) return false
-        val plainLong = items.count { !it.input && !it.text.startsWith("(công thức)") && it.text.length >= 25 }
-        return plainLong < 2
+        // Không có ô chọn/phương án nào trong cây giao diện => nội dung bài nằm trong trang web: luôn nhìn ảnh
+        // (trước đây còn đếm "chữ dài" nên tiêu đề trang/URL dài làm app lúc nhìn ảnh lúc không).
+        return true
     }
 
     // Màn hình đã đứng yên (2 lần chụp liên tiếp giống nhau) -> mới hỏi AI, tránh đọc ảnh lúc trang còn đang trôi.
@@ -428,6 +433,18 @@ class AutoAnswerService : AccessibilityService() {
                 swipePage(true) { afterNav() }
                 return
             }
+            if (visionPending && finishTries < 3) {
+                // AI vừa báo còn câu chưa làm: chưa kết luận hết bài, cuộn/nhìn lại.
+                finishTries++
+                navNote("còn câu chưa làm, thử lại ($finishTries)")
+                bottomReached = false
+                scrollStuck = 0
+                nextScrollUnits = 0
+                lastHash = 0
+                navCooldown = SystemClock.uptimeMillis() + 500
+                return
+            }
+            finishTries = 0
             finishRun("đã làm hết, không thấy nút Tiếp theo")
             return
         }
@@ -507,6 +524,9 @@ class AutoAnswerService : AccessibilityService() {
         markActive()
         slowHashes.clear()
         visionHashes.clear()
+        visionPending = false
+        visionRetry = 0
+        finishTries = 0
         settleSnap = null
         visSnap = null
         status = if (auto) "đang quét" else ""
@@ -827,11 +847,7 @@ class AutoAnswerService : AccessibilityService() {
                 }
                 if (err != null) {
                     lastHash = 0
-                    val wait = if (err.contains("429")) 30000L else 6000L
-                    cooldownUntil = SystemClock.uptimeMillis() + wait
-                    status = "lỗi: " + err.take(80)
-                    refresh()
-                    toast(err)
+                    handleApiError(err)
                     return@post
                 }
                 // Trong lúc chờ AI, màn hình có thể đã sang câu khác: bỏ kết quả cũ và hỏi lại, tránh chạm nhầm.
@@ -891,6 +907,15 @@ class AutoAnswerService : AccessibilityService() {
     // lẫn phương án của câu này sang câu khác khi nhiều câu hiện cùng lúc trên một màn hình.
     private val headerRe = Regex("(?i)^(câu\\s*\\d+\\b|\\d{1,3}[.)])")
 
+    private fun handleApiError(err: String) {
+        val now = SystemClock.uptimeMillis()
+        val waitS = Regex("sau (\\d+)s").find(err)?.groupValues?.get(1)?.toLongOrNull()
+        cooldownUntil = now + (if (waitS != null) (waitS * 1000).coerceIn(3000L, 180000L) else if (err.contains("429")) 30000L else 6000L)
+        status = if (waitS != null) "hết hạn mức API, chờ ${waitS}s" else "lỗi: " + err.take(80)
+        refresh()
+        if (now - lastErrToast > 20000) { lastErrToast = now; toast(err) }
+    }
+
     // CHẾ ĐỘ NHÌN ẢNH: gửi ảnh chụp, AI chọn đáp án và trả toạ độ; app chạm đúng toạ độ đó trên màn hình bài tập.
     private fun runVision(h: Int, key: String) {
         lastHash = h
@@ -907,6 +932,8 @@ class AutoAnswerService : AccessibilityService() {
             }
             val taps = res.taps
             val cuon = res.cuon
+            val retryFlag = res.retry
+            val pendingFlag = res.pending
             val err = gotErr
             handler.post {
                 busy = false
@@ -920,10 +947,7 @@ class AutoAnswerService : AccessibilityService() {
                             toast("Ảnh chụp bị ĐEN: app này chặn chụp màn hình, không thể nhìn ảnh")
                         }
                     } else {
-                        cooldownUntil = SystemClock.uptimeMillis() + (if (err.contains("429")) 30000L else 6000L)
-                        status = "lỗi: " + err.take(80)
-                        refresh()
-                        toast(err)
+                        handleApiError(err)
                     }
                     return@post
                 }
@@ -936,6 +960,16 @@ class AutoAnswerService : AccessibilityService() {
                 }
                 staleCount = 0
                 nextScrollUnits = cuon
+                visionPending = pendingFlag
+                if (retryFlag && visionRetry < 1) {
+                    // Có câu hiện trọn nhưng AI chưa cho đủ thông tin chắc chắn: nhìn lại một lần trước khi chạm/cuộn.
+                    visionRetry++
+                    lastHash = 0
+                    status = "AI chưa rõ vị trí, nhìn lại…"
+                    refresh()
+                    return@post
+                }
+                visionRetry = 0
                 if (taps.isNotEmpty()) upCount = 0
                 if (taps.isEmpty()) {
                     status = "chưa đủ câu hiện trọn, kéo trang…"
