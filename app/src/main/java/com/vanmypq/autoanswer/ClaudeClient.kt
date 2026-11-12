@@ -256,6 +256,9 @@ object ClaudeClient {
         return if (one != null) listOfNotNull(one.groupValues[1].toIntOrNull()) else emptyList()
     }
 
+    // Vị trí (0..1000 theo chiều cao màn hình) mà phương án cuối của câu vừa làm xong sẽ được đưa tới khi cuộn: 250 = 1/4 từ mép trên.
+    private const val ANCHOR_Y = 250
+
     // Định dạng GỌN để AI trả lời nhanh: mỗi câu chỉ khoảng 40 ký tự mã thay vì ~150 (thời gian trả lời chủ yếu tỉ lệ với số chữ AI viết ra).
     private fun visionRules(fast: Boolean): String = """Bạn là giáo viên Việt Nam đang làm bài trắc nghiệm trên điện thoại. Ảnh là ảnh chụp màn hình (thường là trang web gồm nhiều câu nối tiếp nhau theo chiều dọc; mỗi câu có số thứ tự/tiêu đề, đề bài, rồi các phương án có ô tròn ở bên trái).
 Liệt kê MỌI câu xuất hiện trong ảnh (kể cả câu chỉ hiện một phần) theo thứ tự từ trên xuống. Mỗi câu là một phần tử của "cau":
@@ -404,10 +407,10 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
         if (inc.any { it.top < 0 }) cuon = -350
         else if (inc.isNotEmpty()) cuon = inc.minOf { it.top } - 80
         else {
-            // Mọi câu đang hiện đã đủ và đã làm: kéo xuống ĐÚNG vị trí phương án cuối của câu cuối cùng (đưa nó lên sát mép trên)
-            // thì câu kế tiếp hiện ra ngay bên dưới, trọn vẹn nhất.
+            // Mọi câu đang hiện đã đủ và đã làm: kéo xuống ĐÚNG vị trí phương án cuối của câu thấp nhất, đưa nó lên khoảng 1/4
+            // chiều cao màn hình tính từ mép trên (ANCHOR_Y). Câu kế tiếp hiện ngay bên dưới và vẫn còn thấy phần cuối câu trước.
             val last = blocks.filter { it.complete }.maxByOrNull { it.top }
-            if (last != null) cuon = (maxOf(last.bottom, last.lastY + 25) - 30).coerceIn(250, 850)
+            if (last != null) cuon = (maxOf(last.bottom, last.lastY + 25) - ANCHOR_Y).coerceIn(120, 850)
             else if (blocks.isNotEmpty()) cuon = (blocks.maxOf { it.bottom } - 60).coerceIn(350, 800)
         }
         return VResult(taps.sortedBy { it.y }, cuon, retry, pending, need.joinToString(" "))
