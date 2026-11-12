@@ -276,7 +276,7 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
 
     // taps: các điểm cần chạm; cuon: mức cần kéo trang tiếp theo (đơn vị 0..1000 chiều cao màn hình, âm = kéo ngược lên);
     // retry: AI chưa cho đủ thông tin chắc chắn cho một câu đã hiện trọn -> nên nhìn lại; pending: còn câu chưa làm.
-    data class VResult(val taps: List<VTap>, val cuon: Int, val retry: Boolean = false, val pending: Boolean = false, val hint: String = "")
+    data class VResult(val taps: List<VTap>, val cuon: Int, val retry: Boolean = false, val pending: Boolean = false, val hint: String = "", val upLabel: String = "")
 
     private fun visionBody(img: String, mode: Int, fast: Boolean, hint: String = ""): JSONObject {
         val parts = JSONArray()
@@ -313,18 +313,20 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
 
     private fun normKey(s: String): String = s.trim().trimEnd('.', ')', ':').uppercase()
 
+    private fun labelOf(so: String, i: Int): String = Regex("\\d+").find(so)?.value ?: so.trim().ifEmpty { "${i + 1}" }
+
     // Đọc kết quả. App KHÔNG tin hoàn toàn vào AI:
-    //  - câu "đủ" = có dòng tiêu đề và phương án cuối đều nằm trong ảnh (theo toạ độ AI đo), không dựa vào cờ dd;
-    //  - câu "đã chọn" = kiểm tra bằng điểm ảnh tại các ô tròn (CaptureService.isSelectedAt), không dựa vào cờ dc;
+    //  - câu "đủ" = có dòng tiêu đề, có phương án cuối, VÀ có bằng chứng đã hết câu (câu kế tiếp đã hiện tiêu đề, hoặc phương án cuối
+    //    nằm cách mép dưới đủ xa để nếu còn phương án nữa thì phải thấy) - tránh chọn khi một phương án nằm ngoài màn hình;
+    //  - câu "đã chọn" = kiểm tra bằng điểm ảnh tại các ô tròn (CaptureService.selectionAt), không dựa vào cờ dc;
     //  - toạ độ chạm lấy từ CHÍNH phương án được chọn trong danh sách (y phải tăng dần).
-    // Câu đủ, chưa chọn mà AI không đưa đáp án hợp lệ -> retry kèm gợi ý. Mức kéo trang do APP tự tính.
-    private fun parseVision(text: String, allowUp: Boolean): VResult {
-        class Blk(val top: Int, val bottom: Int, val complete: Boolean, val done: Boolean)
-        val taps = ArrayList<VTap>()
-        val blocks = ArrayList<Blk>()
-        val need = ArrayList<String>()
-        var retry = false
-        var pending = false
+    // relax=true (đã cuộn hết trang mà còn câu chưa làm): bỏ yêu cầu "bằng chứng hết câu" và chấp nhận câu sát mép dưới.
+    // upBlocked: các câu đã kéo ngược lên đủ số lần mà vẫn không thấy trọn đầu câu -> bỏ qua, không kéo lên nữa.
+    private fun parseVision(text: String, upBlocked: Set<String>, relax: Boolean): VResult {
+        class Raw(val label: String, val so: String, val dcModel: Boolean, val top: Int, val bot: Int, val chon: String,
+                  val x: Int, val keys: List<String>, val ys: List<Int>)
+        class Blk(val label: String, val top: Int, val bottom: Int, val complete: Boolean, val done: Boolean)
+        val raws = ArrayList<Raw>()
         try {
             val a = text.indexOf('{')
             val b = text.lastIndexOf('}')
@@ -334,11 +336,6 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
                     for (i in 0 until arr.length()) {
                         val o = arr.optJSONObject(i) ?: continue
                         val so = o.optString("so", "").ifEmpty { "${i + 1}" }
-                        val dcModel = o.optBoolean("dc", false)
-                        val top = o.optInt("dau", -1)
-                        val bot = o.optInt("cuoi", 1000)
-                        val chon = normKey(o.optString("chon", ""))
-                        val x = o.optInt("x", -1)
                         val ol = o.optJSONArray("o")
                         val keys = ArrayList<String>()
                         val ys = ArrayList<Int>()
@@ -349,60 +346,75 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
                                 ys.add(e.optInt("y", -1))
                             }
                         }
-                        var listOk = ys.size >= 2 && x in 0..1000 && ys.all { it in 0..1000 }
-                        for (j in 1 until ys.size) if (ys[j] <= ys[j - 1]) listOk = false
-                        val complete = top >= 0 && bot <= 985 && ys.size >= 2
-                        var sel = dcModel
-                        val redIdx = ArrayList<Int>()
-                        val redKeys = ArrayList<String>()
-                        if (listOk) {
-                            var unknown = false
-                            var anySel = false
-                            for (j in ys.indices) {
-                                val r = CaptureService.selectionAt(x, ys[j])
-                                if (r == null) unknown = true
-                                else if (r == 1) anySel = true
-                                else if (r == 2) { redIdx.add(j); redKeys.add(keys.getOrElse(j) { "${j + 1}" }) }
-                            }
-                            // Chỉ có ô ĐỎ (chọn sai) thì coi là chưa làm xong -> phải chọn lại phương án khác.
-                            if (!unknown) sel = anySel
-                        }
-                        var tapped = false
-                        if (complete && !sel) {
-                            var pos = keys.indexOf(chon)
-                            if (pos < 0 && chon.isNotEmpty()) {
-                                val d = chon.toIntOrNull()
-                                if (d != null) pos = d - 1
-                                else if (chon.length == 1 && chon[0] in 'A'..'Z') pos = chon[0] - 'A'
-                            }
-                            if (listOk && chon.isNotEmpty() && pos in ys.indices && pos !in redIdx) {
-                                taps.add(VTap(x, ys[pos], "$so $chon"))
-                                tapped = true
-                            } else {
-                                retry = true
-                                if (redIdx.isNotEmpty()) {
-                                    need.add("Câu $so đã chọn SAI ở phương án ${redKeys.joinToString("/")} (ô tròn màu đỏ): bắt buộc dc=false và chọn phương án ĐÚNG KHÁC phương án đó.")
-                                } else {
-                                    need.add("Câu $so đã hiện trọn trong ảnh và CHƯA có ô nào được chọn (các ô tròn đều còn trống): bắt buộc dc=false và chọn đáp án đúng nhất (\"chon\" không được để trống).")
-                                }
-                            }
-                        }
-                        val ignoreTop = top < 0 && !allowUp   // câu cắt mất đầu ở mép trên: đã xử lý ở màn hình trước, không kéo ngược
-                        blocks.add(Blk(top, bot, complete, sel || tapped || ignoreTop))
-                        if (!sel && !tapped && !ignoreTop) pending = true
+                        raws.add(Raw(labelOf(so, i), so, o.optBoolean("dc", false), o.optInt("dau", -1), o.optInt("cuoi", 1000),
+                            normKey(o.optString("chon", "")), o.optInt("x", -1), keys, ys))
                     }
                 }
             }
         } catch (e: Exception) {
         }
+        val taps = ArrayList<VTap>()
+        val blocks = ArrayList<Blk>()
+        val need = ArrayList<String>()
+        var retry = false
+        var pending = false
+        for ((i, r) in raws.withIndex()) {
+            val ys = r.ys
+            var listOk = ys.size >= 2 && r.x in 0..1000 && ys.all { it in 0..1000 }
+            for (j in 1 until ys.size) if (ys[j] <= ys[j - 1]) listOk = false
+            val lastY = if (ys.isEmpty()) 0 else ys[ys.size - 1]
+            val next = raws.getOrNull(i + 1)
+            val ended = relax || (next != null && next.top >= 0) || lastY <= 860
+            val complete = r.top >= 0 && ys.size >= 2 && r.bot <= (if (relax) 1000 else 985) && ended
+            var sel = r.dcModel
+            val redIdx = ArrayList<Int>()
+            val redKeys = ArrayList<String>()
+            if (listOk) {
+                var unknown = false
+                var anySel = false
+                for (j in ys.indices) {
+                    val st = CaptureService.selectionAt(r.x, ys[j])
+                    if (st == null) unknown = true
+                    else if (st == 1) anySel = true
+                    else if (st == 2) { redIdx.add(j); redKeys.add(r.keys.getOrElse(j) { "${j + 1}" }) }
+                }
+                // Chỉ có ô ĐỎ (chọn sai) thì coi là chưa làm xong -> phải chọn lại phương án khác.
+                if (!unknown) sel = anySel
+            }
+            var tapped = false
+            if (complete && !sel) {
+                var pos = r.keys.indexOf(r.chon)
+                if (pos < 0 && r.chon.isNotEmpty()) {
+                    val d = r.chon.toIntOrNull()
+                    if (d != null) pos = d - 1
+                    else if (r.chon.length == 1 && r.chon[0] in 'A'..'Z') pos = r.chon[0] - 'A'
+                }
+                if (listOk && r.chon.isNotEmpty() && pos in ys.indices && pos !in redIdx) {
+                    taps.add(VTap(r.x, ys[pos], "${r.so} ${r.chon}"))
+                    tapped = true
+                } else {
+                    retry = true
+                    if (redIdx.isNotEmpty()) {
+                        need.add("Câu ${r.so} đã chọn SAI ở phương án ${redKeys.joinToString("/")} (ô tròn màu đỏ): bắt buộc dc=false và chọn phương án ĐÚNG KHÁC phương án đó.")
+                    } else {
+                        need.add("Câu ${r.so} đã hiện trọn trong ảnh và CHƯA có ô nào được chọn (các ô tròn đều còn trống): bắt buộc dc=false và chọn đáp án đúng nhất (\"chon\" không được để trống).")
+                    }
+                }
+            }
+            val ignoreTop = r.top < 0 && r.label in upBlocked
+            blocks.add(Blk(r.label, r.top, r.bot, complete, sel || tapped || ignoreTop))
+            if (!sel && !tapped && !ignoreTop) pending = true
+        }
         // Mức kéo trang (app tự tính): câu chưa làm mất đầu ở mép trên -> kéo ngược lên; câu chưa làm bị cắt ở mép dưới
         // -> đưa đầu câu đó lên sát mép trên; mọi câu đã đủ và đã làm -> kéo qua câu cuối cùng để thấy phần chưa xem.
         var cuon = 0
+        var upLabel = ""
         val inc = blocks.filter { !it.complete && !it.done }
-        if (inc.any { it.top < 0 }) cuon = -350
+        val topCut = inc.firstOrNull { it.top < 0 }
+        if (topCut != null) { cuon = -350; upLabel = topCut.label }
         else if (inc.isNotEmpty()) cuon = inc.minOf { it.top } - 80
         else if (blocks.isNotEmpty()) cuon = (blocks.maxOf { it.bottom } - 60).coerceIn(350, 800)
-        return VResult(taps.sortedBy { it.y }, cuon, retry, pending, need.joinToString(" "))
+        return VResult(taps.sortedBy { it.y }, cuon, retry, pending, need.joinToString(" "), upLabel)
     }
 
     // ---------- Chọn model / key: bỏ qua model đang hết hạn mức, hỗ trợ nhiều API key ----------
@@ -487,13 +499,13 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
 
     // CHẾ ĐỘ NHÌN ẢNH: dùng khi cây giao diện không đưa nội dung trang web (không có ô chọn để chạm theo [id]).
     // AI đọc ảnh chụp, liệt kê các câu đang hiện (đủ/thiếu, đã chọn/chưa) và chọn đáp án; app tự quyết định chạm và kéo trang.
-    fun askVision(apiKey: String, fast: Boolean, allowUp: Boolean = true, hint: String = ""): VResult {
+    fun askVision(apiKey: String, fast: Boolean, upBlocked: Set<String> = emptySet(), hint: String = "", relax: Boolean = false): VResult {
         val img = (try { CaptureService.grab(if (fast) 1024 else 0) } catch (e: Exception) { null })
             ?: throw RuntimeException(if (CaptureService.blackFrame) "Ảnh chụp bị đen (app chặn chụp màn hình)" else "Chưa có ảnh chụp màn hình (hãy bật 📷)")
         val (m, mode, resp) = callModels(apiKey, "vision|$fast", fast) { md -> visionBody(img, md, fast, hint) }
         val text = replyText(resp)
         lastInfo = "Model: $m | CHẾ ĐỘ NHÌN ẢNH | Nhanh: $fast | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
-        return parseVision(text, allowUp)
+        return parseVision(text, upBlocked, relax)
     }
 
     // Không gọi danh sách model trước (bớt 1 vòng mạng); chỉ dò model khi mọi model mặc định đều lỗi.
