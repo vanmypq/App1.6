@@ -9,8 +9,8 @@ android {
         applicationId = "com.vanmypq.autoanswer"
         minSdk = 29
         targetSdk = 34
-        versionCode = 16
-        versionName = "1.9.6"
+        versionCode = 17
+        versionName = "1.9.7"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
