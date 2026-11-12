@@ -102,6 +102,8 @@ class AutoAnswerService : AccessibilityService() {
     private var visionPending = false    // lần nhìn ảnh gần nhất còn câu chưa làm
     private var visionRetry = 0
     private var visionHint = ""        // gợi ý cho lần nhìn lại: các câu đã hiện trọn nhưng chưa được chọn
+    private var redRounds = 0           // số lần chọn lại câu bị chấm SAI trên cùng màn hình
+    private var redTotal = 0
     private var upBudget = 2             // số lần được phép kéo ngược lên trong một lượt chạy (chống lặp lên-xuống)
     private var finishTries = 0
     private var lastErrToast = 0L
@@ -128,11 +130,11 @@ class AutoAnswerService : AccessibilityService() {
     // Khi đó AI phải ĐỌC ẢNH và chỉ toạ độ ô cần chạm (chế độ nhìn ảnh).
     private fun visionScreen(items: List<Item>): Boolean {
         if (!visionAllowed()) return false
-        if (items.any { it.ctrl || optionRe.containsMatchIn(it.text.removePrefix("(chữ ẩn) ")) ||
-                it.text.trim() == "Đúng" || it.text.trim() == "Sai" }) return false
-        // Không có ô chọn/phương án nào trong cây giao diện => nội dung bài nằm trong trang web: luôn nhìn ảnh
-        // (trước đây còn đếm "chữ dài" nên tiêu đề trang/URL dài làm app lúc nhìn ảnh lúc không).
-        return true
+        // ẢNH LÀ NGUỒN CHÍNH: mọi màn hình trắc nghiệm đều để AI đọc ảnh (cây giao diện của trang web thường thiếu ô chọn,
+        // không phản ánh ô đã chọn, và liệt kê cả chữ của phương án nằm ngoài màn hình nên dễ gắn nhầm [id]).
+        // Chỉ khi trong vùng trang có ô nhập chữ (không tính thanh địa chỉ ở trên cùng) mới dùng chế độ chữ để điền.
+        val hh = realMetrics().heightPixels
+        return items.none { it.input && it.rect.top > 0.15f * hh }
     }
 
     // Màn hình đã đứng yên (2 lần chụp liên tiếp giống nhau) -> mới hỏi AI, tránh đọc ảnh lúc trang còn đang trôi.
@@ -530,6 +532,8 @@ class AutoAnswerService : AccessibilityService() {
         visionRetry = 0
         visionHint = ""
         upBudget = 2
+        redRounds = 0
+        redTotal = 0
         finishTries = 0
         settleSnap = null
         visSnap = null
@@ -787,7 +791,7 @@ class AutoAnswerService : AccessibilityService() {
             settleWaits = 0
         }
         val h = curHashOf(items, vision)
-        if (h != currentHash) { currentHash = h; retries = 0; finished = false; markActive() }
+        if (h != currentHash) { currentHash = h; retries = 0; redRounds = 0; finished = false; markActive() }
         if (h == lastHash) { maybeAdvance(items, h); return }
         val lh = layoutOf(items)
         if (lh != layoutHash) {
@@ -991,9 +995,21 @@ class AutoAnswerService : AccessibilityService() {
         }
     }
 
-    private fun finishTaps() {
+    // red = có ô vừa chạm bị chấm SAI (chấm đỏ): chưa cuộn đi mà nhìn lại ngay màn hình này để chọn lại phương án khác.
+    private fun finishTaps(red: Boolean = false) {
         tapping = false
         cooldownUntil = SystemClock.uptimeMillis() + 100
+        if (red && redRounds < 3 && redTotal < 12) {
+            redRounds++
+            redTotal++
+            navNote("ô vừa chọn bị chấm SAI, chọn lại ($redRounds)")
+            status = "chọn lại câu sai…"
+            refresh()
+            visionRetry = 0
+            lastHash = 0
+            markActive()
+            return
+        }
         fastAdvance = true
         afterTap()
     }
@@ -1006,12 +1022,13 @@ class AutoAnswerService : AccessibilityService() {
         if (i >= pts.size) {
             if (round == 0) {
                 handler.postDelayed({
-                    val bad = pts.filter { CaptureService.isSelectedAt(it.first.toInt(), it.second.toInt()) == false }
+                    val st = pts.map { CaptureService.selectionAt(it.first.toInt(), it.second.toInt()) }
+                    val bad = pts.filterIndexed { i, _ -> st[i] == 0 }
                     if (bad.isNotEmpty()) {
                         navNote("chạm chưa trúng ${bad.size} ô, bấm lại")
                         tapPoints(bad.map { Pair(minOf(it.first + 160f, 700f), it.second) }, 0, 1)
                     } else {
-                        finishTaps()
+                        finishTaps(st.any { it == 2 })
                     }
                 }, 280)
             } else {
