@@ -93,7 +93,7 @@ class CaptureService : Service() {
                                 out = Bitmap.createScaledBitmap(cropped, (w * sc).toInt(), (h * sc).toInt(), true)
                             }
                             val bos = ByteArrayOutputStream()
-                            out.compress(Bitmap.CompressFormat.JPEG, if (maxSide > 0) 60 else 72, bos)
+                            out.compress(Bitmap.CompressFormat.JPEG, if (maxSide in 1..1100) 55 else if (maxSide > 0) 62 else 72, bos)
                             cached = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
                         }
                         cachedTs = frameTs
@@ -148,21 +148,6 @@ class CaptureService : Service() {
         }
 
         fun isSelectedAt(xu: Int, yu: Int): Boolean? = selectionAt(xu, yu)?.let { it != 0 }
-
-        // Quét một đoạn dọc theo cột ô tròn (từ y0 đến y1) và trả về trạng thái cao nhất: 0 trống, 1 đã chọn, 2 có dấu SAI (đỏ).
-        // Dùng sau khi chạm vì trang có thể hiện thêm dòng phản hồi làm các ô dời xuống một đoạn.
-        fun columnState(xu: Int, y0: Int, y1: Int): Int? {
-            var best = 0
-            var y = y0.coerceAtLeast(0)
-            val end = y1.coerceAtMost(1000)
-            while (y <= end) {
-                val r = selectionAt(xu, y) ?: return null
-                if (r == 2) return 2
-                if (r > best) best = r
-                y += 8
-            }
-            return best
-        }
 
         @Volatile private var snapTs = 0L
         @Volatile private var snapCache: IntArray? = null
