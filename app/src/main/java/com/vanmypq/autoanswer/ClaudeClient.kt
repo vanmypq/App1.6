@@ -260,7 +260,7 @@ object ClaudeClient {
 NHIỆM VỤ: liệt kê MỌI câu xuất hiện trong ảnh (kể cả câu chỉ hiện một phần), theo thứ tự từ trên xuống. Mỗi câu là một phần tử của "cau" với các trường:
 - "so": số hoặc tiêu đề câu.
 - "dd": true CHỈ KHI cả dòng số thứ tự/tiêu đề của câu VÀ phương án cuối cùng của câu đều nằm TRỌN trong ảnh (không bị cắt ở mép trên hay mép dưới); ngược lại false.
-- "dc": true nếu câu này ĐÃ có phương án được chọn (có ô tròn được tô màu/có dấu chọn). Ô tròn chỉ có viền xám, bên trong trống = CHƯA chọn (dc=false). Nếu không chắc thì để false.
+- "dc": true nếu câu này ĐÃ có phương án được chọn (có ô tròn được tô màu/có dấu chọn). Ô tròn chỉ có viền xám, bên trong trống = CHƯA chọn (dc=false). Ô tròn MÀU ĐỎ hoặc dòng "Bạn đã trả lời sai, vui lòng làm lại" nghĩa là đã chọn SAI: coi là CHƯA xong (dc=false) và phải chọn lại phương án ĐÚNG KHÁC phương án màu đỏ. Ô màu xanh hoặc dòng "Câu trả lời đúng" nghĩa là đã làm đúng (dc=true). Nếu không chắc thì để false.
 - "dau": toạ độ y của mép trên dòng số thứ tự/tiêu đề của câu; -1 nếu dòng đó đã bị cắt mất ở mép trên của ảnh.
 - "cuoi": toạ độ y của mép dưới phương án cuối cùng nhìn thấy; 1000 nếu bị cắt ở mép dưới của ảnh.
 - "tinh": CHỈ khi dd=true và dc=false: lý do cực ngắn (tối đa 12 từ); các trường hợp khác để "".
@@ -282,7 +282,7 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
         val parts = JSONArray()
         parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", img)))
         parts.put(JSONObject().put("text", "Làm bài trắc nghiệm trong ảnh theo hướng dẫn." +
-            (if (hint.isNotEmpty()) " LƯU Ý QUAN TRỌNG: $hint đã hiện trọn trong ảnh và CHƯA có ô nào được chọn (các ô tròn đều còn trống). Với các câu này phải để dc=false và chọn đáp án đúng nhất (\"chon\" không được để trống)." else "")))
+            (if (hint.isNotEmpty()) " LƯU Ý QUAN TRỌNG: $hint" else "")))
         val gen = JSONObject().put("maxOutputTokens", if (fast) 3000 else 4096)
         if (mode == 0) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", if (fast) 0 else 1024))
         if (mode == 1) gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
@@ -353,13 +353,18 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
                         for (j in 1 until ys.size) if (ys[j] <= ys[j - 1]) listOk = false
                         val complete = top >= 0 && bot <= 985 && ys.size >= 2
                         var sel = dcModel
+                        val redIdx = ArrayList<Int>()
+                        val redKeys = ArrayList<String>()
                         if (listOk) {
                             var unknown = false
                             var anySel = false
-                            for (y in ys) {
-                                val r = CaptureService.isSelectedAt(x, y)
-                                if (r == null) unknown = true else if (r) anySel = true
+                            for (j in ys.indices) {
+                                val r = CaptureService.selectionAt(x, ys[j])
+                                if (r == null) unknown = true
+                                else if (r == 1) anySel = true
+                                else if (r == 2) { redIdx.add(j); redKeys.add(keys.getOrElse(j) { "${j + 1}" }) }
                             }
+                            // Chỉ có ô ĐỎ (chọn sai) thì coi là chưa làm xong -> phải chọn lại phương án khác.
                             if (!unknown) sel = anySel
                         }
                         var tapped = false
@@ -370,12 +375,16 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
                                 if (d != null) pos = d - 1
                                 else if (chon.length == 1 && chon[0] in 'A'..'Z') pos = chon[0] - 'A'
                             }
-                            if (listOk && chon.isNotEmpty() && pos in ys.indices) {
+                            if (listOk && chon.isNotEmpty() && pos in ys.indices && pos !in redIdx) {
                                 taps.add(VTap(x, ys[pos], "$so $chon"))
                                 tapped = true
                             } else {
                                 retry = true
-                                need.add("câu $so")
+                                if (redIdx.isNotEmpty()) {
+                                    need.add("Câu $so đã chọn SAI ở phương án ${redKeys.joinToString("/")} (ô tròn màu đỏ): bắt buộc dc=false và chọn phương án ĐÚNG KHÁC phương án đó.")
+                                } else {
+                                    need.add("Câu $so đã hiện trọn trong ảnh và CHƯA có ô nào được chọn (các ô tròn đều còn trống): bắt buộc dc=false và chọn đáp án đúng nhất (\"chon\" không được để trống).")
+                                }
                             }
                         }
                         val ignoreTop = top < 0 && !allowUp   // câu cắt mất đầu ở mép trên: đã xử lý ở màn hình trước, không kéo ngược
@@ -393,7 +402,7 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
         if (inc.any { it.top < 0 }) cuon = -350
         else if (inc.isNotEmpty()) cuon = inc.minOf { it.top } - 80
         else if (blocks.isNotEmpty()) cuon = (blocks.maxOf { it.bottom } - 60).coerceIn(350, 800)
-        return VResult(taps.sortedBy { it.y }, cuon, retry, pending, need.joinToString(", "))
+        return VResult(taps.sortedBy { it.y }, cuon, retry, pending, need.joinToString(" "))
     }
 
     // ---------- Chọn model / key: bỏ qua model đang hết hạn mức, hỗ trợ nhiều API key ----------
