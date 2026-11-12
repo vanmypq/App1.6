@@ -32,7 +32,7 @@ class MainActivity : Activity() {
             textSize = 15f
         })
         val et = EditText(this).apply {
-            hint = "Google Gemini API key (AIza...)"
+            hint = "Google Gemini API key (AIza...). Nhiều key: cách nhau dấu phẩy"
             setText(prefs.getString("key", ""))
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
