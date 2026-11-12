@@ -101,6 +101,8 @@ class AutoAnswerService : AccessibilityService() {
     private var nextScrollUnits = 0      // mức kéo trang do AI/ước tính đề nghị cho lần cuộn kế (0..1000 theo chiều cao, âm = kéo lên)
     private var visionPending = false    // lần nhìn ảnh gần nhất còn câu chưa làm
     private var visionRetry = 0
+    private var visionHint = ""        // gợi ý cho lần nhìn lại: các câu đã hiện trọn nhưng chưa được chọn
+    private var upBudget = 2             // số lần được phép kéo ngược lên trong một lượt chạy (chống lặp lên-xuống)
     private var finishTries = 0
     private var lastErrToast = 0L
     private var upCount = 0             // số lần liên tiếp phải kéo ngược lên (chống lặp lên-xuống khi câu dài hơn màn hình)
@@ -405,7 +407,7 @@ class AutoAnswerService : AccessibilityService() {
             navBusy = true; navStart = now
             var units = if (nextScrollUnits != 0) nextScrollUnits else guidedUnits(items)
             nextScrollUnits = 0
-            if (units < 0 && ++upCount > 2) units = 750
+            if (units < 0) { if (upBudget > 0) upBudget-- else units = 0 }
             if (Math.abs(units) < 120) units = 0
             setStatus(if (units < 0) "kéo ngược lên cho đủ câu…" else "cuộn cho hiện đủ câu kế tiếp…")
             doScroll(units >= 0, units) { r ->
@@ -526,6 +528,8 @@ class AutoAnswerService : AccessibilityService() {
         visionHashes.clear()
         visionPending = false
         visionRetry = 0
+        visionHint = ""
+        upBudget = 2
         finishTries = 0
         settleSnap = null
         visSnap = null
@@ -921,12 +925,15 @@ class AutoAnswerService : AccessibilityService() {
         lastHash = h
         busy = true
         setStatus("AI nhìn ảnh…")
+        val allowUp = upBudget > 0
+        val hintNow = visionHint
+        visionHint = ""
         lastSent = "(chế độ nhìn ảnh: chỉ gửi ảnh chụp màn hình, không có danh sách chữ)"
         exec.execute {
             var res = ClaudeClient.VResult(emptyList(), 0)
             var gotErr: String? = null
             try {
-                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true))
+                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true), allowUp, hintNow)
             } catch (e: Exception) {
                 gotErr = e.message ?: "lỗi mạng"
             }
@@ -964,6 +971,7 @@ class AutoAnswerService : AccessibilityService() {
                 if (retryFlag && visionRetry < 1) {
                     // Có câu hiện trọn nhưng AI chưa cho đủ thông tin chắc chắn: nhìn lại một lần trước khi chạm/cuộn.
                     visionRetry++
+                    visionHint = res.hint
                     lastHash = 0
                     status = "AI chưa rõ vị trí, nhìn lại…"
                     refresh()
@@ -983,21 +991,39 @@ class AutoAnswerService : AccessibilityService() {
         }
     }
 
-    private fun tapPoints(pts: List<Pair<Float, Float>>, i: Int) {
+    private fun finishTaps() {
+        tapping = false
+        cooldownUntil = SystemClock.uptimeMillis() + 100
+        fastAdvance = true
+        afterTap()
+    }
+
+    // Chạm lần lượt các điểm (đơn vị 0..1000). Sau lượt đầu kiểm tra bằng điểm ảnh xem từng ô đã thật sự được tích chưa;
+    // ô nào chưa thì bấm lại một lần vào chữ của phương án (nhãn của ô thường cũng bấm được).
+    private fun tapPoints(pts: List<Pair<Float, Float>>, i: Int, round: Int = 0) {
         tapping = true
         tapStart = SystemClock.uptimeMillis()
         if (i >= pts.size) {
-            tapping = false
-            cooldownUntil = SystemClock.uptimeMillis() + 100
-            fastAdvance = true
-            afterTap()
+            if (round == 0) {
+                handler.postDelayed({
+                    val bad = pts.filter { CaptureService.isSelectedAt(it.first.toInt(), it.second.toInt()) == false }
+                    if (bad.isNotEmpty()) {
+                        navNote("chạm chưa trúng ${bad.size} ô, bấm lại")
+                        tapPoints(bad.map { Pair(minOf(it.first + 160f, 700f), it.second) }, 0, 1)
+                    } else {
+                        finishTaps()
+                    }
+                }, 280)
+            } else {
+                finishTaps()
+            }
             return
         }
         val dm = realMetrics()
         val px = (pts[i].first / 1000f * dm.widthPixels).toInt()
         val py = (pts[i].second / 1000f * dm.heightPixels).toInt()
         tap(Rect(px - 1, py - 1, px + 1, py + 1)) {
-            handler.postDelayed({ tapPoints(pts, i + 1) }, 50)
+            handler.postDelayed({ tapPoints(pts, i + 1, round) }, 50)
         }
     }
 
