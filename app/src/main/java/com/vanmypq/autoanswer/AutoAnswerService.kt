@@ -104,9 +104,9 @@ class AutoAnswerService : AccessibilityService() {
     private var visionHint = ""        // gợi ý cho lần nhìn lại: các câu đã hiện trọn nhưng chưa được chọn
     private var redRounds = 0           // số lần chọn lại câu bị chấm SAI trên cùng màn hình
     private var redTotal = 0
-    private val upTries = HashMap<String, Int>()   // số lần đã kéo ngược lên cho từng câu (tối đa 2, chống lặp lên-xuống)
-    private var lastUpLabel = ""
-    private var visionRelax = false      // đã cuộn hết trang mà còn câu chưa làm: nới điều kiện "câu hiện đủ"
+    private var tickSnap: IntArray? = null
+    private var movingTicks = 0
+    private var upBudget = 2             // số lần được phép kéo ngược lên trong một lượt chạy (chống lặp lên-xuống)
     private var finishTries = 0
     private var lastErrToast = 0L
     private var upCount = 0             // số lần liên tiếp phải kéo ngược lên (chống lặp lên-xuống khi câu dài hơn màn hình)
@@ -254,17 +254,17 @@ class AutoAnswerService : AccessibilityService() {
         val dm = realMetrics()
         val hh = dm.heightPixels.toFloat()
         val x = dm.widthPixels * 0.5f
-        val dist = units.coerceIn(100, 850) / 1000f * hh
+        val dist = (units + 13).coerceIn(100, 850) / 1000f * hh   // +13: bù đoạn ngón tay trượt đầu tiên (touch slop) chưa làm trang cuộn
         val half = if (down) dist / 2 else -dist / 2
         val y1 = (hh * 0.5f + half).coerceIn(hh * 0.06f, hh * 0.93f)
         val y2 = (hh * 0.5f - half).coerceIn(hh * 0.06f, hh * 0.93f)
-        val dur = (dist / 3.0f).toLong().coerceIn(150L, 450L)
+        val dur = (dist / 1.6f).toLong().coerceIn(180L, 700L)
         val p1 = Path().apply { moveTo(x, y1); lineTo(x, y2) }
         val s1 = GestureDescription.StrokeDescription(p1, 0, dur, true)
         val ok1 = dispatchGesture(GestureDescription.Builder().addStroke(s1).build(), object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 val p2 = Path().apply { moveTo(x, y2) }
-                val s2 = s1.continueStroke(p2, 0, 80, false)
+                val s2 = s1.continueStroke(p2, 0, 120, false)
                 val ok2 = dispatchGesture(GestureDescription.Builder().addStroke(s2).build(), object : GestureResultCallback() {
                     override fun onCompleted(g: GestureDescription?) { onDone(true) }
                     override fun onCancelled(g: GestureDescription?) { onDone(false) }
@@ -399,7 +399,7 @@ class AutoAnswerService : AccessibilityService() {
 
     // Gọi khi màn hình đã xử lý xong và đứng yên: cuộn xuống tìm câu mới; hết trang thì bấm nút Tiếp theo.
     private fun maybeAdvance(items: List<Item>, h: Int) {
-        if (navBusy || finished) return
+        if (navBusy || finished || cfg().getBoolean("follow", false)) return   // chế độ "tôi tự cuộn": không tự cuộn/qua trang
         val p = cfg()
         val optScroll = p.getBoolean("scroll", true)
         val optNext = p.getBoolean("next", true)
@@ -411,10 +411,7 @@ class AutoAnswerService : AccessibilityService() {
             navBusy = true; navStart = now
             var units = if (nextScrollUnits != 0) nextScrollUnits else guidedUnits(items)
             nextScrollUnits = 0
-            if (units < 0) {
-                val n = upTries[lastUpLabel] ?: 0
-                if (n >= 2) units = 0 else upTries[lastUpLabel] = n + 1
-            }
+            if (units < 0) { if (upBudget > 0) upBudget-- else units = 0 }
             if (Math.abs(units) < 120) units = 0
             setStatus(if (units < 0) "kéo ngược lên cho đủ câu…" else "cuộn cho hiện đủ câu kế tiếp…")
             doScroll(units >= 0, units) { r ->
@@ -446,7 +443,6 @@ class AutoAnswerService : AccessibilityService() {
                 // AI vừa báo còn câu chưa làm: chưa kết luận hết bài, cuộn/nhìn lại.
                 finishTries++
                 navNote("còn câu chưa làm, thử lại ($finishTries)")
-                visionRelax = true
                 bottomReached = false
                 scrollStuck = 0
                 nextScrollUnits = 0
@@ -476,7 +472,7 @@ class AutoAnswerService : AccessibilityService() {
         override fun run() {
             if (!auto) return
             tick()
-            handler.postDelayed(this, 120)
+            handler.postDelayed(this, 100)
         }
     }
 
@@ -537,9 +533,7 @@ class AutoAnswerService : AccessibilityService() {
         visionPending = false
         visionRetry = 0
         visionHint = ""
-        upTries.clear()
-        lastUpLabel = ""
-        visionRelax = false
+        upBudget = 2
         redRounds = 0
         redTotal = 0
         finishTries = 0
@@ -549,9 +543,23 @@ class AutoAnswerService : AccessibilityService() {
         refresh()
         handler.removeCallbacks(loop)
         if (auto) {
+            // Khởi động nhanh cho câu ĐẦU TIÊN: coi màn hình hiện tại là đã đứng yên (khỏi chờ ổn định), chuẩn bị sẵn
+            // ảnh và kết nối mạng ở luồng riêng (không xếp hàng sau lượt hỏi AI).
+            try {
+                val snap0 = CaptureService.snapshot()
+                settleSnap = snap0
+                visSnap = snap0
+                tickSnap = snap0
+                movingTicks = 0
+                layoutHash = layoutOf(collect())
+            } catch (e: Exception) {
+            }
             handler.post(loop)
             val k = getSharedPreferences("cfg", MODE_PRIVATE).getString("key", "") ?: ""
-            if (k.isNotBlank()) exec.execute { ClaudeClient.warmUp(k) }
+            if (k.isNotBlank()) {
+                val fastNow = cfg().getBoolean("fast", true)
+                Thread { ClaudeClient.warmUp(k, fastNow) }.start()
+            }
         }
     }
 
@@ -576,6 +584,23 @@ class AutoAnswerService : AccessibilityService() {
         val key = getSharedPreferences("cfg", MODE_PRIVATE).getString("key", "") ?: ""
         if (key.isBlank()) {
             toast("Chưa nhập API key"); auto = false; refresh(); return
+        }
+        if (visionAllowed()) {
+            // Màn hình còn đang trôi (người dùng đang cuộn / trang đang chạy): chờ, không tốn công đọc cây giao diện.
+            // Dừng lại là xử lý ngay (không chờ thêm). Hiệu ứng liên tục thì chỉ chờ tối đa ~3 giây.
+            val snap = CaptureService.snapshot()
+            if (snap != null) {
+                val prev = tickSnap
+                tickSnap = snap
+                val moving = prev != null && CaptureService.differs(prev, snap)
+                if (moving) {
+                    if (++movingTicks == 1) setStatus("chờ trang ổn định…")
+                    if (movingTicks < 30) return
+                } else {
+                    movingTicks = 0
+                }
+                settleSnap = snap
+            }
         }
         val items = collect()
         if (items.sumOf { it.text.length } >= 40) {
@@ -937,17 +962,15 @@ class AutoAnswerService : AccessibilityService() {
         lastHash = h
         busy = true
         setStatus("AI nhìn ảnh…")
-        val blocked = upTries.filter { it.value >= 2 }.keys.toSet()
+        val allowUp = upBudget > 0
         val hintNow = visionHint
-        val relaxNow = visionRelax
         visionHint = ""
-        visionRelax = false
         lastSent = "(chế độ nhìn ảnh: chỉ gửi ảnh chụp màn hình, không có danh sách chữ)"
         exec.execute {
             var res = ClaudeClient.VResult(emptyList(), 0)
             var gotErr: String? = null
             try {
-                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true), blocked, hintNow, relaxNow)
+                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true), allowUp, hintNow)
             } catch (e: Exception) {
                 gotErr = e.message ?: "lỗi mạng"
             }
@@ -955,7 +978,6 @@ class AutoAnswerService : AccessibilityService() {
             val cuon = res.cuon
             val retryFlag = res.retry
             val pendingFlag = res.pending
-            val upLabelNow = res.upLabel
             val err = gotErr
             handler.post {
                 busy = false
@@ -982,7 +1004,6 @@ class AutoAnswerService : AccessibilityService() {
                 }
                 staleCount = 0
                 nextScrollUnits = cuon
-                lastUpLabel = upLabelNow
                 visionPending = pendingFlag
                 if (retryFlag && visionRetry < 1) {
                     // Có câu hiện trọn nhưng AI chưa cho đủ thông tin chắc chắn: nhìn lại một lần trước khi chạm/cuộn.
@@ -1026,43 +1047,34 @@ class AutoAnswerService : AccessibilityService() {
         afterTap()
     }
 
-    // Chạm lần lượt các điểm (đơn vị 0..1000), rồi kiểm tra kết quả.
-    private fun tapPoints(pts: List<Pair<Float, Float>>, i: Int) {
+    // Chạm lần lượt các điểm (đơn vị 0..1000). Sau lượt đầu kiểm tra bằng điểm ảnh xem từng ô đã thật sự được tích chưa;
+    // ô nào chưa thì bấm lại một lần vào chữ của phương án (nhãn của ô thường cũng bấm được).
+    private fun tapPoints(pts: List<Pair<Float, Float>>, i: Int, round: Int = 0) {
         tapping = true
         tapStart = SystemClock.uptimeMillis()
         if (i >= pts.size) {
-            verifyTaps(pts)
+            if (round == 0) {
+                handler.postDelayed({
+                    val st = pts.map { CaptureService.selectionAt(it.first.toInt(), it.second.toInt()) }
+                    val bad = pts.filterIndexed { i, _ -> st[i] == 0 }
+                    if (bad.isNotEmpty()) {
+                        navNote("chạm chưa trúng ${bad.size} ô, bấm lại")
+                        tapPoints(bad.map { Pair(minOf(it.first + 160f, 700f), it.second) }, 0, 1)
+                    } else {
+                        finishTaps(st.any { it == 2 })
+                    }
+                }, 280)
+            } else {
+                finishTaps()
+            }
             return
         }
         val dm = realMetrics()
         val px = (pts[i].first / 1000f * dm.widthPixels).toInt()
         val py = (pts[i].second / 1000f * dm.heightPixels).toInt()
         tap(Rect(px - 1, py - 1, px + 1, py + 1)) {
-            handler.postDelayed({ tapPoints(pts, i + 1) }, 40)
+            handler.postDelayed({ tapPoints(pts, i + 1, round) }, 50)
         }
-    }
-
-    // Kiểm tra từng ô vừa chạm bằng cách quét cột ô tròn phía dưới điểm đã chạm (trang thường hiện thêm dòng phản hồi làm các ô
-    // dời xuống, nên KHÔNG kiểm tra đúng một điểm và KHÔNG bấm lại mù - bấm lại có thể trúng phương án khác).
-    // Thấy dấu sai (đỏ) hoặc không thấy ô nào được chọn -> nhìn lại màn hình bằng ảnh mới thay vì cuộn đi.
-    private fun verifyTaps(pts: List<Pair<Float, Float>>) {
-        val t0 = SystemClock.uptimeMillis()
-        val r = object : Runnable {
-            override fun run() {
-                val st = pts.map { CaptureService.columnState(it.first.toInt(), it.second.toInt() - 30, it.second.toInt() + 230) }
-                val waited = SystemClock.uptimeMillis() - t0
-                val anyRed = st.any { it == 2 }
-                val allSel = st.all { it != null && it >= 1 }
-                if (anyRed || allSel || waited >= 450) {
-                    val missing = st.any { it == 0 }
-                    if (missing) navNote("chưa thấy ô nào được chọn sau khi chạm")
-                    finishTaps(anyRed || missing)
-                } else {
-                    handler.postDelayed(this, 70)
-                }
-            }
-        }
-        handler.postDelayed(r, 120)
     }
 
     // Vị trí tương đối của phần tử trên màn hình (%), để AI đối chiếu ô chọn với phương án trong ảnh chụp.
