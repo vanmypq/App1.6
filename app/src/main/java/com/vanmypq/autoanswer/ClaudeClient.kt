@@ -256,45 +256,53 @@ object ClaudeClient {
         return if (one != null) listOfNotNull(one.groupValues[1].toIntOrNull()) else emptyList()
     }
 
-    private val VISION_RULES = """Bạn là giáo viên Việt Nam đang làm bài trắc nghiệm trên điện thoại. Ảnh là ảnh chụp màn hình (thường là trang web, có thể có thanh địa chỉ hoặc nút điều hướng).
-QUY TẮC: CHỈ trả lời câu mà trong ảnh thấy ĐỦ cả đề bài (từ số thứ tự tới hết câu hỏi) VÀ ĐỦ TẤT CẢ phương án, và CHƯA có phương án nào được chọn (ô đã tô màu/có dấu chọn nghĩa là đã làm, BỎ QUA). Câu bị cắt ở mép trên hoặc mép dưới màn hình (thiếu một phần đề hoặc thiếu phương án) thì TUYỆT ĐỐI KHÔNG trả lời mà phải báo cần kéo trang (trường "cuon"). Ngoại lệ: câu dài hơn cả màn hình thì vẫn trả lời nếu đã thấy đủ phần cần thiết để quyết định.
-Với mỗi câu cần làm: ghi lý do RẤT NGẮN (tối đa 12 từ) rồi chọn đáp án đúng nhất (câu phủ định KHÔNG PHẢI/SAI/NGOẠI TRỪ thì chọn phương án không thỏa điều kiện; câu lý thuyết vẫn phải chọn phương án phù hợp NHẤT, không được bỏ trống).
-Trả về JSON {"cau":[{"so":"số hoặc tiêu đề câu","tinh":"lý do cực ngắn","dap_an":"chữ cái hoặc thứ tự 1-4","x":số,"y":số}],"cuon":số}.
-"cau": mỗi phần tử là một câu cần chạm. x, y là TOẠ ĐỘ TÂM của ô tròn/ô vuông (hoặc dấu chọn) nằm ngay trước phương án đúng, đo trên ảnh, chuẩn hoá thành số nguyên 0..1000 (x: 0 = mép trái, 1000 = mép phải; y: 0 = mép trên, 1000 = mép dưới). Nếu phương án không có ô tròn thì lấy tâm dòng chữ của phương án đó. Điểm phải nằm đúng phương án đã chọn, không lệch sang phương án bên trên/dưới. Nếu không có câu nào đủ điều kiện thì "cau": [].
-"cuon": số nguyên (đơn vị 0..1000 theo chiều CAO của ảnh) cho biết cần kéo trang bao nhiêu để câu CHƯA hiện đủ gần nhất hiện ra trọn vẹn. Số dương = kéo trang xuống (nội dung chạy lên), số âm = kéo ngược lên.
- - Có câu chưa làm bị cắt ở mép TRÊN (thấy phương án nhưng mất một phần đề): cuon = -350. Nếu đồng thời còn câu bị cắt ở mép dưới thì ƯU TIÊN số âm này trước.
- - Có câu chưa làm bị cắt ở mép DƯỚI (thiếu phương án), hoặc số thứ tự/tiêu đề của câu kế tiếp đang nằm ở nửa dưới màn hình: cuon = (y của dòng đầu tiên - số thứ tự hoặc tiêu đề - của câu đó) trừ 80, để đầu câu đó lên sát mép trên màn hình.
- - Mọi câu đang hiện đã đủ và đã được làm hoặc đã chọn: cuon = 750.
- - Đã thấy cuối trang (nút Kết thúc/Nộp bài, không còn câu nào bên dưới): cuon = 0.
-KHÔNG chạm các nút Kết thúc / Nộp bài / Tiếp theo / Xem lại."""
+    private val VISION_RULES = """Bạn là giáo viên Việt Nam đang làm bài trắc nghiệm trên điện thoại. Ảnh là ảnh chụp màn hình (thường là trang web gồm nhiều câu nối tiếp nhau theo chiều dọc; mỗi câu có số thứ tự/tiêu đề, đề bài, rồi các phương án có ô tròn ở bên trái).
+NHIỆM VỤ: liệt kê MỌI câu xuất hiện trong ảnh (kể cả câu chỉ hiện một phần), theo thứ tự từ trên xuống. Mỗi câu là một phần tử của "cau" với các trường:
+- "so": số hoặc tiêu đề câu.
+- "dd": true CHỈ KHI cả dòng số thứ tự/tiêu đề của câu VÀ phương án cuối cùng của câu đều nằm TRỌN trong ảnh (không bị cắt ở mép trên hay mép dưới); ngược lại false.
+- "dc": true nếu câu này ĐÃ có phương án được chọn (ô tròn đã tô màu hoặc có dấu chọn); ngược lại false.
+- "dau": toạ độ y của mép trên dòng số thứ tự/tiêu đề của câu; -1 nếu dòng đó đã bị cắt mất ở mép trên của ảnh.
+- "cuoi": toạ độ y của mép dưới phương án cuối cùng nhìn thấy; 1000 nếu bị cắt ở mép dưới của ảnh.
+- "tinh": CHỈ khi dd=true và dc=false: lý do cực ngắn (tối đa 12 từ); các trường hợp khác để "".
+- "chon": CHỈ khi dd=true và dc=false: nhãn (A, B, C, D... hoặc 1, 2, 3, 4 theo thứ tự từ trên xuống) của phương án ĐÚNG NHẤT. Câu phủ định (KHÔNG PHẢI/SAI/NGOẠI TRỪ) chọn phương án không thỏa điều kiện; câu lý thuyết vẫn phải chọn phương án phù hợp NHẤT, không được bỏ trống. Các trường hợp khác để "".
+- "x": toạ độ x của tâm các ô tròn/ô vuông phương án (cùng một cột).
+- "o": CHỈ với câu có "chon": liệt kê TẤT CẢ phương án nhìn thấy của câu theo thứ tự từ trên xuống, mỗi phần tử {"k": nhãn phương án, "y": toạ độ y của tâm ô tròn của phương án đó}. Hãy đo riêng từng phương án; y phải tăng dần từ trên xuống và mỗi phương án đứng cách nhau đúng bằng khoảng cách thật trong ảnh. Với câu không có "chon" thì "o": [].
+Mọi toạ độ là số nguyên 0..1000 theo ảnh (x: 0 = mép trái, 1000 = mép phải; y: 0 = mép trên, 1000 = mép dưới).
+Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ, nút Kết thúc / Nộp bài / Tiếp theo / Xem lại và các dòng thông báo không thuộc câu hỏi."""
 
     private fun strProp() = JSONObject().put("type", "STRING")
     private fun intProp() = JSONObject().put("type", "INTEGER")
+    private fun boolProp() = JSONObject().put("type", "BOOLEAN")
 
-    // taps: các điểm cần chạm; cuon: AI đề nghị kéo trang bao nhiêu (đơn vị 0..1000 chiều cao màn hình, âm = kéo ngược lên).
-    data class VResult(val taps: List<VTap>, val cuon: Int)
+    // taps: các điểm cần chạm; cuon: mức cần kéo trang tiếp theo (đơn vị 0..1000 chiều cao màn hình, âm = kéo ngược lên);
+    // retry: AI chưa cho đủ thông tin chắc chắn cho một câu đã hiện trọn -> nên nhìn lại; pending: còn câu chưa làm.
+    data class VResult(val taps: List<VTap>, val cuon: Int, val retry: Boolean = false, val pending: Boolean = false)
 
     private fun visionBody(img: String, mode: Int, fast: Boolean): JSONObject {
         val parts = JSONArray()
         parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", img)))
         parts.put(JSONObject().put("text", "Làm bài trắc nghiệm trong ảnh theo hướng dẫn."))
-        val gen = JSONObject().put("maxOutputTokens", if (fast) 1500 else 4096)
+        val gen = JSONObject().put("maxOutputTokens", if (fast) 2500 else 4096)
         if (mode == 0) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", if (fast) 0 else 1024))
         if (mode == 1) gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
         if (mode < 3) {
-            val names = listOf("so", "tinh", "dap_an", "x", "y")
+            val names = listOf("so", "dd", "dc", "dau", "cuoi", "tinh", "chon", "x", "o")
+            val opt = JSONObject().put("type", "OBJECT")
+                .put("properties", JSONObject().put("k", strProp()).put("y", intProp()))
+                .put("propertyOrdering", JSONArray(listOf("k", "y")))
+                .put("required", JSONArray(listOf("k", "y")))
             val item = JSONObject().put("type", "OBJECT")
-                .put("properties", JSONObject().put("so", strProp()).put("tinh", strProp()).put("dap_an", strProp())
-                    .put("x", intProp()).put("y", intProp()))
+                .put("properties", JSONObject()
+                    .put("so", strProp()).put("dd", boolProp()).put("dc", boolProp())
+                    .put("dau", intProp()).put("cuoi", intProp()).put("tinh", strProp())
+                    .put("chon", strProp()).put("x", intProp())
+                    .put("o", JSONObject().put("type", "ARRAY").put("items", opt)))
                 .put("propertyOrdering", JSONArray(names))
                 .put("required", JSONArray(names))
             gen.put("responseMimeType", "application/json")
             gen.put("responseSchema", JSONObject().put("type", "OBJECT")
-                .put("properties", JSONObject()
-                    .put("cau", JSONObject().put("type", "ARRAY").put("items", item))
-                    .put("cuon", intProp()))
-                .put("propertyOrdering", JSONArray(listOf("cau", "cuon")))
-                .put("required", JSONArray(listOf("cau", "cuon"))))
+                .put("properties", JSONObject().put("cau", JSONObject().put("type", "ARRAY").put("items", item)))
+                .put("required", JSONArray(listOf("cau"))))
         }
         return JSONObject()
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", VISION_RULES))))
@@ -302,70 +310,168 @@ KHÔNG chạm các nút Kết thúc / Nộp bài / Tiếp theo / Xem lại."""
             .put("generationConfig", gen)
     }
 
+    private fun normKey(s: String): String = s.trim().trimEnd('.', ')', ':').uppercase()
+
+    // Đọc kết quả: chỉ chạm khi câu hiện TRỌN, chưa chọn, và danh sách toạ độ các phương án hợp lý (tăng dần, có phương án được chọn).
+    // Toạ độ chạm lấy từ CHÍNH phương án được chọn trong danh sách -> không thể lệch sang phương án khác như khi AI tự ghi 1 toạ độ.
+    // Mức kéo trang do APP tự tính từ vị trí các câu AI báo (không để AI tự ước lượng).
     private fun parseVision(text: String): VResult {
-        val out = ArrayList<VTap>()
-        var cuon = 0
+        class Blk(val top: Int, val bottom: Int, val complete: Boolean, val done: Boolean)
+        val taps = ArrayList<VTap>()
+        val blocks = ArrayList<Blk>()
+        var retry = false
+        var pending = false
         try {
             val a = text.indexOf('{')
             val b = text.lastIndexOf('}')
             if (a >= 0 && b > a) {
-                val root = JSONObject(text.substring(a, b + 1))
-                cuon = root.optInt("cuon", 0).coerceIn(-900, 900)
-                val arr = root.optJSONArray("cau")
+                val arr = JSONObject(text.substring(a, b + 1)).optJSONArray("cau")
                 if (arr != null) {
                     for (i in 0 until arr.length()) {
                         val o = arr.optJSONObject(i) ?: continue
-                        val x = o.optInt("x", -1)
-                        val y = o.optInt("y", -1)
-                        if (x !in 0..1000 || y !in 0..1000) continue
-                        if (out.any { Math.abs(it.x - x) < 15 && Math.abs(it.y - y) < 15 }) continue
-                        out.add(VTap(x, y, o.optString("so") + " " + o.optString("dap_an")))
+                        val dd = o.optBoolean("dd", false)
+                        val dc = o.optBoolean("dc", false)
+                        val top = o.optInt("dau", -1)
+                        val bot = o.optInt("cuoi", 1000)
+                        val chon = normKey(o.optString("chon", ""))
+                        var tapped = false
+                        if (dd && !dc) {
+                            if (chon.isEmpty()) {
+                                retry = true
+                            } else {
+                                val ol = o.optJSONArray("o")
+                                val keys = ArrayList<String>()
+                                val ys = ArrayList<Int>()
+                                if (ol != null) {
+                                    for (j in 0 until ol.length()) {
+                                        val e = ol.optJSONObject(j) ?: continue
+                                        keys.add(normKey(e.optString("k", "")))
+                                        ys.add(e.optInt("y", -1))
+                                    }
+                                }
+                                var ok = ys.size >= 2 && ys.all { it in 0..1000 }
+                                for (j in 1 until ys.size) if (ys[j] <= ys[j - 1]) ok = false
+                                var pos = keys.indexOf(chon)
+                                if (pos < 0) {
+                                    val d = chon.toIntOrNull()
+                                    if (d != null) pos = d - 1
+                                    else if (chon.length == 1 && chon[0] in 'A'..'Z') pos = chon[0] - 'A'
+                                }
+                                val x = o.optInt("x", -1)
+                                if (ok && pos in ys.indices && x in 0..1000) {
+                                    taps.add(VTap(x, ys[pos], o.optString("so") + " " + chon))
+                                    tapped = true
+                                } else {
+                                    retry = true
+                                }
+                            }
+                        }
+                        blocks.add(Blk(top, bot, dd, dc || tapped))
+                        if (!dc && !tapped) pending = true
                     }
                 }
             }
         } catch (e: Exception) {
         }
-        return VResult(out.sortedBy { it.y }, cuon)
+        // Quyết định kéo trang (do app tính): câu chưa làm mất đầu ở mép trên -> kéo ngược lên; câu chưa làm bị cắt ở mép dưới
+        // -> đưa đầu câu đó lên sát mép trên; mọi câu đã đủ và đã làm -> kéo qua câu cuối cùng để thấy phần chưa xem.
+        var cuon = 0
+        val inc = blocks.filter { !it.complete && !it.done }
+        if (inc.any { it.top < 0 }) cuon = -350
+        else if (inc.isNotEmpty()) cuon = inc.minOf { it.top } - 80
+        else if (blocks.isNotEmpty()) cuon = (blocks.maxOf { it.bottom } - 60).coerceIn(350, 800)
+        return VResult(taps.sortedBy { it.y }, cuon, retry, pending)
     }
 
-    // CHẾ ĐỘ NHÌN ẢNH: dùng khi cây giao diện không đưa nội dung trang web (không có ô chọn để chạm theo [id]).
-    // AI đọc ảnh chụp, chỉ làm câu hiện ĐỦ đề và đủ phương án, trả toạ độ ô cần chạm và mức cần kéo trang.
-    fun askVision(apiKey: String, fast: Boolean): VResult {
-        // Ảnh nhỏ hơn (1024px, chất lượng 60) -> tải lên nhanh hơn rất nhiều trên mạng di động; chế độ chính xác dùng ảnh gốc.
-        val img = (try { CaptureService.grab(if (fast) 1024 else 0) } catch (e: Exception) { null })
-            ?: throw RuntimeException(if (CaptureService.blackFrame) "Ảnh chụp bị đen (app chặn chụp màn hình)" else "Chưa có ảnh chụp màn hình (hãy bật 📷)")
-        val base = models ?: DEFAULT_MODELS
-        if (idx != 0 && System.currentTimeMillis() - switchedAt > 120000L) idx = 0
+    // ---------- Chọn model / key: bỏ qua model đang hết hạn mức, hỗ trợ nhiều API key ----------
+    private val blockedUntil = HashMap<String, Long>()
+    private val badKeys = HashSet<String>()
+
+    private fun kid(k: String) = k.takeLast(8)
+
+    // Có thể dán nhiều API key cách nhau dấu phẩy/xuống dòng: mỗi key có hạn mức riêng nên chuyển key khi một key hết quota.
+    private fun keysOf(raw: String): List<String> {
+        val l = raw.split(Regex("[,;\\s]+")).map { it.trim() }.filter { it.length >= 10 }
+        return if (l.isEmpty()) listOf(raw.trim()) else l
+    }
+
+    // Khoá (key, model) đến khi hết thời gian server yêu cầu chờ (retryDelay); hết hạn mức theo NGÀY thì khoá 1 giờ.
+    private fun blockFor(key: String, m: String, resp: String, defSec: Long) {
+        var sec = defSec
+        val mt = Regex("\"retryDelay\"\\s*:\\s*\"(\\d+(?:\\.\\d+)?)s\"").find(resp)
+            ?: Regex("retry in (\\d+(?:\\.\\d+)?)s", RegexOption.IGNORE_CASE).find(resp)
+        if (mt != null) sec = Math.ceil(mt.groupValues[1].toDouble()).toLong() + 1
+        if (resp.contains("PerDay", ignoreCase = true) || resp.contains("per day", ignoreCase = true)) sec = maxOf(sec, 3600L)
+        blockedUntil[kid(key) + "|" + m] = System.currentTimeMillis() + sec * 1000
+    }
+
+    // Gọi lần lượt (model ưu tiên, key) chưa bị khoá. Trả (tên model, chế độ suy nghĩ, phản hồi).
+    private fun callModels(apiKeyRaw: String, tag: String, fast: Boolean, bodyOf: (Int) -> JSONObject): Triple<String, Int, String> {
+        val keys = keysOf(apiKeyRaw)
         var lastErr = "không có model"
-        var tries = 0
-        while (tries < base.size) {
-            val m = base[idx % base.size]
-            val mk = "$m|vision|$fast"
+        var attempts = 0
+        while (attempts < 20) {
+            val base = models ?: DEFAULT_MODELS
+            val now = System.currentTimeMillis()
+            var pm: String? = null
+            var pk: String? = null
+            outer@ for (mm in base) {
+                for (kk in keys) {
+                    if (badKeys.contains(kid(kk))) continue
+                    if ((blockedUntil[kid(kk) + "|" + mm] ?: 0L) <= now) { pm = mm; pk = kk; break@outer }
+                }
+            }
+            if (pm == null || pk == null) {
+                if (models == null) {
+                    try { loadModels(keys[0]); attempts++; continue } catch (e: Exception) { }
+                }
+                if (keys.all { badKeys.contains(kid(it)) }) throw RuntimeException("API key không hợp lệ: $lastErr")
+                var minT = Long.MAX_VALUE
+                for (mm in base) for (kk in keys) {
+                    if (!badKeys.contains(kid(kk))) minT = minOf(minT, blockedUntil[kid(kk) + "|" + mm] ?: 0L)
+                }
+                val wait = ((minT - now) / 1000 + 1).coerceAtLeast(1)
+                throw RuntimeException("Hết hạn mức API (429) ở mọi model/key, tự thử lại sau ${wait}s. $lastErr")
+            }
+            val m: String = pm
+            val k: String = pk
+            val mk = "$m|$tag"
             var mode = modeOf[mk] ?: 0
-            var r = post(apiKey, m, visionBody(img, mode, fast), fast)
+            var r = post(k, m, bodyOf(mode), fast)
             while (r.first == 400 && mode < 3 && !r.second.contains("API key", ignoreCase = true)) {
                 mode++
-                r = post(apiKey, m, visionBody(img, mode, fast), fast)
+                r = post(k, m, bodyOf(mode), fast)
             }
             if (r.first in 200..299) {
                 if (mode < 3) modeOf[mk] = mode
-                val text = replyText(r.second)
-                lastInfo = "Model: $m | CHẾ ĐỘ NHÌN ẢNH | Nhanh: $fast | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
-                return parseVision(text)
+                return Triple(m, mode, r.second)
             }
             lastErr = "HTTP ${r.first} ($m): ${r.second.take(120)}"
-            if (r.first == 429 || r.first == 404 || r.first == 408 || r.first == 500 || r.first == 503) {
-                lastSwitch = "Đã chuyển khỏi $m vì: $lastErr"
-                idx++
-                switchedAt = System.currentTimeMillis()
-                tries++
-                continue
+            when {
+                r.first == 429 -> blockFor(k, m, r.second, 45)
+                r.first == 404 -> for (kk in keys) blockFor(kk, m, "", 900)
+                r.first == 408 || r.first == 500 || r.first == 503 -> blockFor(k, m, "", 15)
+                r.first == 401 || r.first == 403 || (r.first == 400 && r.second.contains("API key", ignoreCase = true)) -> {
+                    badKeys.add(kid(k))
+                    if (keys.all { badKeys.contains(kid(it)) }) throw RuntimeException(lastErr)
+                }
+                else -> throw RuntimeException(lastErr)
             }
-            throw RuntimeException(lastErr)
+            lastSwitch = "Đã chuyển khỏi $m (key …${kid(k).takeLast(4)}) vì: " + lastErr.take(90)
+            attempts++
         }
-        models = null
-        try { loadModels(apiKey) } catch (e: Exception) { }
         throw RuntimeException(lastErr)
+    }
+
+    // CHẾ ĐỘ NHÌN ẢNH: dùng khi cây giao diện không đưa nội dung trang web (không có ô chọn để chạm theo [id]).
+    // AI đọc ảnh chụp, liệt kê các câu đang hiện (đủ/thiếu, đã chọn/chưa) và chọn đáp án; app tự quyết định chạm và kéo trang.
+    fun askVision(apiKey: String, fast: Boolean): VResult {
+        val img = (try { CaptureService.grab(if (fast) 1024 else 0) } catch (e: Exception) { null })
+            ?: throw RuntimeException(if (CaptureService.blackFrame) "Ảnh chụp bị đen (app chặn chụp màn hình)" else "Chưa có ảnh chụp màn hình (hãy bật 📷)")
+        val (m, mode, resp) = callModels(apiKey, "vision|$fast", fast) { md -> visionBody(img, md, fast) }
+        val text = replyText(resp)
+        lastInfo = "Model: $m | CHẾ ĐỘ NHÌN ẢNH | Nhanh: $fast | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
+        return parseVision(text)
     }
 
     // Không gọi danh sách model trước (bớt 1 vòng mạng); chỉ dò model khi mọi model mặc định đều lỗi.
@@ -377,7 +483,7 @@ KHÔNG chạm các nút Kết thúc / Nộp bài / Tiếp theo / Xem lại."""
             val c = URL("$BASE/models/gemini-flash-lite-latest").openConnection() as HttpURLConnection
             c.connectTimeout = 5000
             c.readTimeout = 5000
-            c.setRequestProperty("x-goog-api-key", apiKey)
+            c.setRequestProperty("x-goog-api-key", keysOf(apiKey)[0])
             c.responseCode
             (try { c.inputStream } catch (e: Exception) { c.errorStream })?.use { it.readBytes() }
         } catch (e: Exception) {
@@ -392,40 +498,12 @@ KHÔNG chạm các nút Kết thúc / Nộp bài / Tiếp theo / Xem lại."""
         // Chế độ nhanh chỉ gửi ảnh khi có công thức; chế độ chính xác luôn gửi ảnh.
         val needImg = alwaysImg || !fast || screenText.contains("(công thức)") || screenText.contains("xem ảnh")
         val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1024 else 0) } catch (e: Exception) { null }) else null
-        val base = models ?: DEFAULT_MODELS
-        // Cả hai chế độ đều ưu tiên Flash đầy đủ (Lite hay đoán sai bài toán); Lite chỉ là dự phòng khi lỗi/hết hạn mức.
-        val list = base
-        if (idx != 0 && System.currentTimeMillis() - switchedAt > 120000L) idx = 0
-        var lastErr = "không có model"
-        var tries = 0
-        while (tries < list.size) {
-            val m = list[idx % list.size]
-            val mk = "$m|$search|$hasInput|$fast"
-            var mode = modeOf[mk] ?: 0
-            var r = post(apiKey, m, buildBody(screenText, mode, img, fast, search, hasInput), if (search) false else fast)
-            while (r.first == 400 && mode < 3 && !r.second.contains("API key", ignoreCase = true)) {
-                mode++
-                r = post(apiKey, m, buildBody(screenText, mode, img, fast, search, hasInput), if (search) false else fast)
-            }
-            if (r.first in 200..299) {
-                if (mode < 3) modeOf[mk] = mode
-                val text = replyText(r.second)
-                lastInfo = "Model: $m | Nhanh: $fast | Ảnh: " + (if (img != null && mode < 3) "CÓ" else "KHÔNG") +
-                    " | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
-                return parseAnswer(text)
-            }
-            lastErr = "HTTP ${r.first} ($m): ${r.second.take(120)}"
-            if (r.first == 429 || r.first == 404 || r.first == 408 || r.first == 500 || r.first == 503) {
-                lastSwitch = "Đã chuyển khỏi $m vì: $lastErr"
-                idx++
-                switchedAt = System.currentTimeMillis()
-                tries++
-                continue
-            }
-            throw RuntimeException(lastErr)
+        val (m, mode, resp) = callModels(apiKey, "$search|$hasInput|$fast", if (search) false else fast) { md ->
+            buildBody(screenText, md, img, fast, search, hasInput)
         }
-        models = null
-        try { loadModels(apiKey) } catch (e: Exception) { }
-        throw RuntimeException(lastErr)
+        val text = replyText(resp)
+        lastInfo = "Model: $m | Nhanh: $fast | Ảnh: " + (if (img != null && mode < 3) "CÓ" else "KHÔNG") +
+            " | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
+        return parseAnswer(text)
     }
 }
