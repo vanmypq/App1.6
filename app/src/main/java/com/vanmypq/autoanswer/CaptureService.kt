@@ -105,6 +105,47 @@ class CaptureService : Service() {
             }
         }
 
+        // Ô tròn/ô vuông tại (xu, yu) (0..1000 theo ảnh) có ĐÃ ĐƯỢC CHỌN không? Ô chưa chọn: viền xám, bên trong trắng;
+        // ô đã chọn: bên trong có chấm/nền màu. Kiểm tra bằng điểm ảnh thật nên đáng tin hơn việc nhờ AI nhận xét.
+        // Trả null nếu chưa có khung hình.
+        fun isSelectedAt(xu: Int, yu: Int): Boolean? {
+            if (reader == null) return null
+            return synchronized(lock) {
+                val image = latest ?: return@synchronized null
+                try {
+                    val plane = image.planes[0]
+                    val buf = plane.buffer
+                    val rs = plane.rowStride
+                    val ps = plane.pixelStride
+                    val cx = (xu * w / 1000).coerceIn(2, w - 3)
+                    var sel = false
+                    for (dyu in intArrayOf(-8, -4, 0, 4, 8)) {
+                        val cy = ((yu + dyu) * h / 1000).coerceIn(2, h - 3)
+                        var r = 0
+                        var g = 0
+                        var b = 0
+                        var n = 0
+                        for (dy in -2..2 step 2) {
+                            for (dx in -2..2 step 2) {
+                                val o = (cy + dy) * rs + (cx + dx) * ps
+                                r += buf.get(o).toInt() and 0xff
+                                g += buf.get(o + 1).toInt() and 0xff
+                                b += buf.get(o + 2).toInt() and 0xff
+                                n++
+                            }
+                        }
+                        r /= n; g /= n; b /= n
+                        val lum = (r + g + b) / 3
+                        val sat = maxOf(r, g, b) - minOf(r, g, b)
+                        if ((sat > 40 && lum < 225) || lum < 100) { sel = true; break }
+                    }
+                    sel
+                } catch (e: Exception) {
+                    null
+                }
+            }
+        }
+
         @Volatile private var snapTs = 0L
         @Volatile private var snapCache: IntArray? = null
 
