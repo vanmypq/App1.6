@@ -105,10 +105,10 @@ class CaptureService : Service() {
             }
         }
 
-        // Ô tròn/ô vuông tại (xu, yu) (0..1000 theo ảnh) có ĐÃ ĐƯỢC CHỌN không? Ô chưa chọn: viền xám, bên trong trắng;
-        // ô đã chọn: bên trong có chấm/nền màu. Kiểm tra bằng điểm ảnh thật nên đáng tin hơn việc nhờ AI nhận xét.
+        // Trạng thái ô tròn/ô vuông tại (xu, yu) (0..1000 theo ảnh), kiểm tra bằng điểm ảnh thật (đáng tin hơn nhờ AI nhận xét):
+        // 0 = chưa chọn (viền xám, bên trong trống), 1 = đã chọn (chấm màu xanh/tối), 2 = đã chọn nhưng bị chấm SAI (chấm màu đỏ).
         // Trả null nếu chưa có khung hình.
-        fun isSelectedAt(xu: Int, yu: Int): Boolean? {
+        fun selectionAt(xu: Int, yu: Int): Int? {
             if (reader == null) return null
             return synchronized(lock) {
                 val image = latest ?: return@synchronized null
@@ -118,7 +118,7 @@ class CaptureService : Service() {
                     val rs = plane.rowStride
                     val ps = plane.pixelStride
                     val cx = (xu * w / 1000).coerceIn(2, w - 3)
-                    var sel = false
+                    var best = 0
                     for (dyu in intArrayOf(-8, -4, 0, 4, 8)) {
                         val cy = ((yu + dyu) * h / 1000).coerceIn(2, h - 3)
                         var r = 0
@@ -137,14 +137,17 @@ class CaptureService : Service() {
                         r /= n; g /= n; b /= n
                         val lum = (r + g + b) / 3
                         val sat = maxOf(r, g, b) - minOf(r, g, b)
-                        if ((sat > 40 && lum < 225) || lum < 100) { sel = true; break }
+                        if (r > 150 && r - g > 70 && r - b > 70) { best = 2; break }
+                        if ((sat > 40 && lum < 225) || lum < 100) best = maxOf(best, 1)
                     }
-                    sel
+                    best
                 } catch (e: Exception) {
                     null
                 }
             }
         }
+
+        fun isSelectedAt(xu: Int, yu: Int): Boolean? = selectionAt(xu, yu)?.let { it != 0 }
 
         @Volatile private var snapTs = 0L
         @Volatile private var snapCache: IntArray? = null
