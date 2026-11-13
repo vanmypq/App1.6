@@ -220,12 +220,13 @@ class AutoAnswerService : AccessibilityService() {
         if (!ok) onDone(false)
     }
 
+    // Vuốt dự phòng: luôn bắt đầu từ GIỮA màn hình và vuốt lên tới sát mép trên (cuộn xuống); cuộn lên thì từ giữa vuốt xuống dưới.
     private fun swipeScroll(down: Boolean, xFrac: Float, onDone: (Boolean) -> Unit) {
-        val dm = resources.displayMetrics
+        val dm = realMetrics()
         val x = dm.widthPixels * xFrac
-        val a = dm.heightPixels * 0.75f
-        val b = dm.heightPixels * 0.30f
-        if (down) swipe(x, a, x, b, 300, onDone) else swipe(x, b, x, a, 300, onDone)
+        val a = dm.heightPixels * 0.5f
+        if (down) swipe(x, a, x, dm.heightPixels * 0.05f, 300, onDone)
+        else swipe(x, a, x, dm.heightPixels * 0.9f, 300, onDone)
     }
 
     private fun swipePage(forward: Boolean, onDone: (Boolean) -> Unit) {
@@ -250,14 +251,29 @@ class AutoAnswerService : AccessibilityService() {
 
     // Kéo trang CHÍNH XÁC một đoạn (đơn vị 0..1000 chiều cao màn hình): kéo rồi giữ yên ngón tay một chút để trang
     // dừng đúng chỗ, không bị trượt thêm do đà (fling).
+    // Mỗi lần kéo luôn BẮT ĐẦU Ở GIỮA màn hình và kéo ngón tay lên tới sát mép trên (cuộn lên thì từ giữa kéo xuống phía dưới).
+    // Một lần kéo tối đa ~46% chiều cao (từ giữa tới mép trên). Cần cuộn nhiều hơn thì kéo liên tiếp nhiều lần,
+    // mỗi lần lại bắt đầu từ giữa. units: 0..1000 theo chiều cao màn hình.
     private fun dragScroll(down: Boolean, units: Int, onDone: (Boolean) -> Unit) {
+        val maxChunk = if (down) 460 else 400
+        fun step(remain: Int) {
+            if (remain <= 0) { onDone(true); return }
+            val chunk = minOf(remain + 13, maxChunk)      // +13: bù đoạn ngón tay trượt đầu tiên (touch slop) chưa làm trang cuộn
+            dragOnce(down, chunk) { ok ->
+                if (!ok) onDone(false) else step(remain - (chunk - 13))
+            }
+        }
+        step(units.coerceIn(100, 920))
+    }
+
+    private fun dragOnce(down: Boolean, chunk: Int, onDone: (Boolean) -> Unit) {
         val dm = realMetrics()
         val hh = dm.heightPixels.toFloat()
         val x = dm.widthPixels * 0.5f
-        val dist = (units + 13).coerceIn(100, 850) / 1000f * hh   // +13: bù đoạn ngón tay trượt đầu tiên (touch slop) chưa làm trang cuộn
-        val half = if (down) dist / 2 else -dist / 2
-        val y1 = (hh * 0.5f + half).coerceIn(hh * 0.06f, hh * 0.93f)
-        val y2 = (hh * 0.5f - half).coerceIn(hh * 0.06f, hh * 0.93f)
+        val dist = chunk / 1000f * hh
+        val y1 = hh * 0.5f                                                        // luôn bắt đầu từ giữa màn hình
+        val y2 = if (down) (y1 - dist).coerceAtLeast(hh * 0.04f)                 // kéo lên tới sát mép trên
+                 else (y1 + dist).coerceAtMost(hh * 0.92f)
         val dur = (dist / 1.6f).toLong().coerceIn(180L, 700L)
         val p1 = Path().apply { moveTo(x, y1); lineTo(x, y2) }
         val s1 = GestureDescription.StrokeDescription(p1, 0, dur, true)
