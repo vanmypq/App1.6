@@ -86,7 +86,7 @@ class AutoAnswerService : AccessibilityService() {
 
 
     // ===== CUỘN TRANG / QUA TRANG (v1.9) =====
-    private val settleMs = 250L
+    private val settleMs = 150L
     private var lastActivity = 0L
     private var navCooldown = 0L
     private var navBusy = false
@@ -108,6 +108,7 @@ class AutoAnswerService : AccessibilityService() {
     private var movingTicks = 0
     private val upTries = HashMap<String, Int>()   // số lần đã kéo ngược lên cho từng câu (tối đa 2, chống lặp lên-xuống)
     private var lastUpLabel = ""
+    private val optHist = HashMap<Int, Int>()      // thống kê số phương án của các câu đã hiện đủ (để biết số phương án quen thuộc)
     private val doneLabels = HashSet<String>()     // nhãn các câu đã làm (kể cả khi ô đã chọn nằm ngoài ảnh)
     private var visionRelax = false      // đã cuộn hết trang mà còn câu chưa làm: nới điều kiện "câu hiện đủ"
     private var topChecked = false       // đã kiểm tra xem có đang ở giữa trang không
@@ -463,7 +464,7 @@ class AutoAnswerService : AccessibilityService() {
                 val n = upTries[lastUpLabel] ?: 0
                 if (n >= 2) units = 0 else upTries[lastUpLabel] = n + 1
             }
-            if (Math.abs(units) < 120) units = 0
+            if (Math.abs(units) < 120) units = if (visionScreen(items)) 420 else 0   // chế độ nhìn ảnh: không dùng lệnh cuộn "cả trang" (quá đà)
             setStatus(if (units < 0) "kéo ngược lên cho đủ câu…" else "cuộn cho hiện đủ câu kế tiếp…")
             doScroll(units >= 0, units) { r ->
                 navBusy = false
@@ -588,6 +589,7 @@ class AutoAnswerService : AccessibilityService() {
         upTries.clear()
         lastUpLabel = ""
         doneLabels.clear()
+        optHist.clear()
         visionRelax = false
         topChecked = false
         goTop = false
@@ -1021,6 +1023,9 @@ class AutoAnswerService : AccessibilityService() {
         lastHash = h
         busy = true
         setStatus("AI nhìn ảnh…")
+        val vid0 = visId
+        val totalOpts = optHist.values.sum()
+        val typicalNow = if (totalOpts >= 2) (optHist.maxByOrNull { it.value }?.key ?: 0) else 0
         val blocked = upTries.filter { it.value >= 2 }.keys.toSet()
         val hintNow = visionHint
         val relaxNow = visionRelax
@@ -1032,7 +1037,7 @@ class AutoAnswerService : AccessibilityService() {
             var res = ClaudeClient.VResult(emptyList(), 0)
             var gotErr: String? = null
             try {
-                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true), blocked, hintNow, relaxNow, doneNow)
+                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true), blocked, hintNow, relaxNow, doneNow, typicalNow)
             } catch (e: Exception) {
                 gotErr = e.message ?: "lỗi mạng"
             }
@@ -1043,6 +1048,7 @@ class AutoAnswerService : AccessibilityService() {
             val upLabelNow = res.upLabel
             val minLabelNow = res.minLabel
             val doneOut = res.doneLabels
+            val countsOut = res.completeCounts
             val err = gotErr
             handler.post {
                 busy = false
@@ -1060,7 +1066,7 @@ class AutoAnswerService : AccessibilityService() {
                     }
                     return@post
                 }
-                if (curHash(collect()) != h && staleCount < 2) {
+                if (visualId() != vid0 && staleCount < 2) {
                     staleCount++
                     lastHash = 0
                     status = "màn hình đã đổi, nhìn lại…"
@@ -1082,6 +1088,7 @@ class AutoAnswerService : AccessibilityService() {
                 }
                 visionRetry = 0
                 doneLabels.addAll(doneOut)
+                for (c in countsOut) optHist[c] = (optHist[c] ?: 0) + 1
                 if (!topChecked) {
                     topChecked = true
                     if (minLabelNow in 2..999 && !cfg().getBoolean("follow", false)) {
@@ -1122,34 +1129,44 @@ class AutoAnswerService : AccessibilityService() {
         afterTap()
     }
 
-    // Chạm lần lượt các điểm (đơn vị 0..1000). Sau lượt đầu kiểm tra bằng điểm ảnh xem từng ô đã thật sự được tích chưa;
-    // ô nào chưa thì bấm lại một lần vào chữ của phương án (nhãn của ô thường cũng bấm được).
-    private fun tapPoints(pts: List<Pair<Float, Float>>, i: Int, round: Int = 0) {
+    // Chạm lần lượt các điểm (đơn vị 0..1000), rồi kiểm tra kết quả.
+    private fun tapPoints(pts: List<Pair<Float, Float>>, i: Int) {
         tapping = true
         tapStart = SystemClock.uptimeMillis()
         if (i >= pts.size) {
-            if (round == 0) {
-                handler.postDelayed({
-                    val st = pts.map { CaptureService.selectionAt(it.first.toInt(), it.second.toInt()) }
-                    val bad = pts.filterIndexed { i, _ -> st[i] == 0 }
-                    if (bad.isNotEmpty()) {
-                        navNote("chạm chưa trúng ${bad.size} ô, bấm lại")
-                        tapPoints(bad.map { Pair(minOf(it.first + 160f, 700f), it.second) }, 0, 1)
-                    } else {
-                        finishTaps(st.any { it == 2 })
-                    }
-                }, 280)
-            } else {
-                finishTaps()
-            }
+            verifyTaps(pts)
             return
         }
         val dm = realMetrics()
         val px = (pts[i].first / 1000f * dm.widthPixels).toInt()
         val py = (pts[i].second / 1000f * dm.heightPixels).toInt()
         tap(Rect(px - 1, py - 1, px + 1, py + 1)) {
-            handler.postDelayed({ tapPoints(pts, i + 1, round) }, 50)
+            handler.postDelayed({ tapPoints(pts, i + 1) }, 30)
         }
+    }
+
+    // Kiểm tra từng ô vừa chạm bằng cách quét cột ô tròn phía dưới điểm đã chạm (trang thường hiện thêm dòng phản hồi làm các ô
+    // dời xuống, nên KHÔNG kiểm tra đúng một điểm và KHÔNG bấm lại mù - bấm lại có thể trúng PHƯƠNG ÁN KHÁC).
+    // Thấy dấu sai (đỏ) hoặc không thấy ô nào được chọn -> nhìn lại màn hình bằng ảnh mới thay vì cuộn đi.
+    // Kiểm tra liên tục 70ms/lần: thấy ô được chọn là đi tiếp ngay (thường ~150ms thay vì chờ cố định 280ms).
+    private fun verifyTaps(pts: List<Pair<Float, Float>>) {
+        val t0 = SystemClock.uptimeMillis()
+        val r = object : Runnable {
+            override fun run() {
+                val st = pts.map { CaptureService.columnState(it.first.toInt(), it.second.toInt() - 30, it.second.toInt() + 230) }
+                val waited = SystemClock.uptimeMillis() - t0
+                val anyRed = st.any { it == 2 }
+                val allSel = st.all { it != null && it >= 1 }
+                if (anyRed || allSel || waited >= 450) {
+                    val missing = st.any { it == 0 }
+                    if (missing) navNote("chưa thấy ô nào được chọn sau khi chạm")
+                    finishTaps(anyRed || missing)
+                } else {
+                    handler.postDelayed(this, 70)
+                }
+            }
+        }
+        handler.postDelayed(r, 100)
     }
 
     // Vị trí tương đối của phần tử trên màn hình (%), để AI đối chiếu ô chọn với phương án trong ảnh chụp.
@@ -1313,7 +1330,7 @@ class AutoAnswerService : AccessibilityService() {
             // Vừa chạm xong ở chế độ nhìn ảnh: coi như đã đứng yên đủ lâu để cuộn ngay.
             lastActivity = SystemClock.uptimeMillis() - (if (fastAdvance) settleMs else 0L)
             fastAdvance = false
-        }, 100)
+        }, 60)
     }
 
     private fun clickNode(n: AccessibilityNodeInfo?) {
