@@ -106,7 +106,13 @@ class AutoAnswerService : AccessibilityService() {
     private var redTotal = 0
     private var tickSnap: IntArray? = null
     private var movingTicks = 0
-    private var upBudget = 2             // số lần được phép kéo ngược lên trong một lượt chạy (chống lặp lên-xuống)
+    private val upTries = HashMap<String, Int>()   // số lần đã kéo ngược lên cho từng câu (tối đa 2, chống lặp lên-xuống)
+    private var lastUpLabel = ""
+    private val doneLabels = HashSet<String>()     // nhãn các câu đã làm (kể cả khi ô đã chọn nằm ngoài ảnh)
+    private var visionRelax = false      // đã cuộn hết trang mà còn câu chưa làm: nới điều kiện "câu hiện đủ"
+    private var topChecked = false       // đã kiểm tra xem có đang ở giữa trang không
+    private var goTop = false            // đang kéo về đầu trang (không hỏi AI trong lúc kéo)
+    private var goTopSteps = 0
     private var finishTries = 0
     private var lastErrToast = 0L
     private var upCount = 0             // số lần liên tiếp phải kéo ngược lên (chống lặp lên-xuống khi câu dài hơn màn hình)
@@ -401,6 +407,8 @@ class AutoAnswerService : AccessibilityService() {
 
     private fun finishRun(msg: String) {
         navNote("KẾT THÚC: $msg")
+        doneLabels.clear()
+        upTries.clear()
         finished = true
         status = "✔ $msg"
         refresh()
@@ -423,11 +431,38 @@ class AutoAnswerService : AccessibilityService() {
         val now = SystemClock.uptimeMillis()
         if (now - lastActivity < settleMs || now < navCooldown) return
         if (!navAllowed()) return
+        if (goTop) {
+            // Đang ở giữa trang (câu đầu hiện ra không phải câu 1): kéo thẳng về đầu trang, không hỏi AI trong lúc kéo.
+            if (!optScroll) {
+                goTop = false
+            } else {
+                navBusy = true; navStart = now
+                setStatus("kéo về đầu trang…")
+                doScroll(false, 0) { r ->
+                    navBusy = false
+                    markActive()
+                    if (r == 1 && ++goTopSteps < 40) {
+                        // còn kéo được: lần quét sau kéo tiếp
+                    } else {
+                        goTop = false
+                        lastHash = 0
+                        bottomReached = false
+                        scrollStuck = 0
+                        nextScrollUnits = 0
+                        navNote("đã về đầu trang sau $goTopSteps lần kéo")
+                    }
+                }
+                return
+            }
+        }
         if (optScroll && !bottomReached) {
             navBusy = true; navStart = now
             var units = if (nextScrollUnits != 0) nextScrollUnits else guidedUnits(items)
             nextScrollUnits = 0
-            if (units < 0) { if (upBudget > 0) upBudget-- else units = 0 }
+            if (units < 0) {
+                val n = upTries[lastUpLabel] ?: 0
+                if (n >= 2) units = 0 else upTries[lastUpLabel] = n + 1
+            }
             if (Math.abs(units) < 120) units = 0
             setStatus(if (units < 0) "kéo ngược lên cho đủ câu…" else "cuộn cho hiện đủ câu kế tiếp…")
             doScroll(units >= 0, units) { r ->
@@ -459,6 +494,7 @@ class AutoAnswerService : AccessibilityService() {
                 // AI vừa báo còn câu chưa làm: chưa kết luận hết bài, cuộn/nhìn lại.
                 finishTries++
                 navNote("còn câu chưa làm, thử lại ($finishTries)")
+                visionRelax = true
                 bottomReached = false
                 scrollStuck = 0
                 nextScrollUnits = 0
@@ -549,7 +585,13 @@ class AutoAnswerService : AccessibilityService() {
         visionPending = false
         visionRetry = 0
         visionHint = ""
-        upBudget = 2
+        upTries.clear()
+        lastUpLabel = ""
+        doneLabels.clear()
+        visionRelax = false
+        topChecked = false
+        goTop = false
+        goTopSteps = 0
         redRounds = 0
         redTotal = 0
         finishTries = 0
@@ -841,6 +883,7 @@ class AutoAnswerService : AccessibilityService() {
         }
         val h = curHashOf(items, vision)
         if (h != currentHash) { currentHash = h; retries = 0; redRounds = 0; finished = false; markActive() }
+        if (goTop) { maybeAdvance(items, h); return }
         if (h == lastHash) { maybeAdvance(items, h); return }
         val lh = layoutOf(items)
         if (lh != layoutHash) {
@@ -978,15 +1021,18 @@ class AutoAnswerService : AccessibilityService() {
         lastHash = h
         busy = true
         setStatus("AI nhìn ảnh…")
-        val allowUp = upBudget > 0
+        val blocked = upTries.filter { it.value >= 2 }.keys.toSet()
         val hintNow = visionHint
+        val relaxNow = visionRelax
+        val doneNow = doneLabels.toSet()
         visionHint = ""
+        visionRelax = false
         lastSent = "(chế độ nhìn ảnh: chỉ gửi ảnh chụp màn hình, không có danh sách chữ)"
         exec.execute {
             var res = ClaudeClient.VResult(emptyList(), 0)
             var gotErr: String? = null
             try {
-                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true), allowUp, hintNow)
+                res = ClaudeClient.askVision(key, cfg().getBoolean("fast", true), blocked, hintNow, relaxNow, doneNow)
             } catch (e: Exception) {
                 gotErr = e.message ?: "lỗi mạng"
             }
@@ -994,6 +1040,9 @@ class AutoAnswerService : AccessibilityService() {
             val cuon = res.cuon
             val retryFlag = res.retry
             val pendingFlag = res.pending
+            val upLabelNow = res.upLabel
+            val minLabelNow = res.minLabel
+            val doneOut = res.doneLabels
             val err = gotErr
             handler.post {
                 busy = false
@@ -1020,6 +1069,7 @@ class AutoAnswerService : AccessibilityService() {
                 }
                 staleCount = 0
                 nextScrollUnits = cuon
+                lastUpLabel = upLabelNow
                 visionPending = pendingFlag
                 if (retryFlag && visionRetry < 1) {
                     // Có câu hiện trọn nhưng AI chưa cho đủ thông tin chắc chắn: nhìn lại một lần trước khi chạm/cuộn.
@@ -1031,6 +1081,15 @@ class AutoAnswerService : AccessibilityService() {
                     return@post
                 }
                 visionRetry = 0
+                doneLabels.addAll(doneOut)
+                if (!topChecked) {
+                    topChecked = true
+                    if (minLabelNow in 2..999 && !cfg().getBoolean("follow", false)) {
+                        goTop = true
+                        goTopSteps = 0
+                        navNote("đang ở giữa trang (thấy câu $minLabelNow đầu tiên), sẽ kéo về đầu trang")
+                    }
+                }
                 if (taps.isNotEmpty()) upCount = 0
                 if (taps.isEmpty()) {
                     status = "chưa đủ câu hiện trọn, kéo trang…"
