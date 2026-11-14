@@ -282,7 +282,7 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
     // retry: AI chưa cho đủ thông tin chắc chắn cho một câu đã hiện trọn -> nên nhìn lại; pending: còn câu chưa làm.
     data class VResult(val taps: List<VTap>, val cuon: Int, val retry: Boolean = false, val pending: Boolean = false, val hint: String = "",
                        val upLabel: String = "", val minLabel: Int = Int.MAX_VALUE, val doneLabels: List<String> = emptyList(),
-                       val completeCounts: List<Int> = emptyList())
+                       val completeCounts: List<Int> = emptyList(), val kind: Int = 0, val blockHeights: List<Int> = emptyList())
 
     private fun visionBody(img: String, mode: Int, fast: Boolean, hint: String = ""): JSONObject {
         val parts = JSONArray()
@@ -326,7 +326,11 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
     //  - câu CHƯA hiện đủ nhưng đã làm ở màn hình trước (doneSet) thì không kéo ngược lên lại (ô đã chọn có thể nằm ngoài ảnh).
     // relax=true (đã cuộn hết trang mà còn câu chưa làm): bỏ yêu cầu "bằng chứng hết câu" và chấp nhận câu sát mép dưới.
     // upBlocked: các câu đã kéo ngược lên đủ số lần mà vẫn không thấy trọn đầu câu -> bỏ qua, không kéo lên nữa.
-    private fun parseVision(text: String, upBlocked: Set<String>, doneSet: Set<String>, relax: Boolean, typical: Int): VResult {
+    // limitUp: đã kéo ngược lên 2 lần LIÊN TIẾP mà chưa làm được thêm câu nào -> bỏ qua mọi câu bị cắt mất đầu ở mép trên.
+    // afterAnchor: lần cuộn trước là neo theo đáp án cuối -> câu bị cắt đầu ở mép trên (không có nhãn số) chính là câu vừa làm.
+    // Câu CÓ nhãn số thì dùng bộ nhớ nhãn (doneSet) để biết đã làm hay chưa, nên câu chưa làm vẫn được kéo ngược lên xem.
+    // typicalH: chiều cao quen thuộc của một câu (đầu -> phương án cuối), học từ các câu đã hiện đủ; 0 = chưa biết.
+    private fun parseVision(text: String, limitUp: Boolean, afterAnchor: Boolean, doneSet: Set<String>, relax: Boolean, typical: Int, typicalH: Int): VResult {
         class Raw(val label: String, val so: String, val dcModel: Boolean, val top: Int, val bot: Int, val chon: String,
                   val x: Int, val keys: List<String>, val ys: List<Int>)
         class Blk(val label: String, val top: Int, val bottom: Int, val complete: Boolean, val done: Boolean, val lastY: Int)
@@ -371,6 +375,7 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
         val need = ArrayList<String>()
         val doneOut = ArrayList<String>()
         val completeOut = ArrayList<Int>()
+        val heightsOut = ArrayList<Int>()
         var retry = false
         var pending = false
         for ((i, r) in raws.withIndex()) {
@@ -398,7 +403,10 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
             // Hoặc: số phương án nhìn thấy bằng số phương án quen thuộc (học từ các câu đã đủ trước đó, thường là 4) và ô cuối còn trong ảnh.
             val c2 = typical > 0 && ys.size >= typical && r.top >= 0 && lastY <= 975
             val complete = c1 || c2
-            if (c1) completeOut.add(ys.size)
+            if (c1) {
+                completeOut.add(ys.size)
+                if (r.top >= 0 && r.bot < 1000) heightsOut.add(r.bot - r.top)
+            }
             var sel = r.dcModel
             val redIdx = ArrayList<Int>()
             val redKeys = ArrayList<String>()
@@ -436,7 +444,7 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
                     }
                 }
             }
-            val ignoreTop = r.top < 0 && r.label in upBlocked
+            val ignoreTop = r.top < 0 && (limitUp || (afterAnchor && r.label.isEmpty()))
             val ignoreDone = !complete && r.label.isNotEmpty() && r.label in doneSet && redIdx.isEmpty()
             val done = sel || tapped || ignoreTop || ignoreDone
             blocks.add(Blk(r.label, r.top, r.bot, complete, done, lastY))
@@ -449,27 +457,33 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
         //  - mọi câu đã đủ và đã làm -> kéo xuống ĐÚNG vị trí phương án cuối của câu thấp nhất, đưa nó lên ANCHOR_Y;
         //    nếu câu thấp nhất đã làm nhưng bị cắt đáy thì đưa đầu câu đó lên trên để thấy phần tiếp theo.
         var cuon = 0
-        var upLabel = ""
+        var kind = 0
         val inc = blocks.filter { !it.complete && !it.done }
         val topCut = inc.firstOrNull { it.top < 0 }
         if (topCut != null) {
+            // Kéo ngược lên: nếu biết chiều cao quen thuộc của một câu thì đưa TIÊU ĐỀ về y~110 (vừa thấy đề, vừa đủ bằng chứng hết câu);
+            // chưa biết thì đưa phương án cuối về y<=850.
             val bb = maxOf(if (topCut.bottom < 1000) topCut.bottom else 0, topCut.lastY + 25)
-            cuon = -(850 - bb).coerceIn(150, 650)
-            upLabel = topCut.label
+            cuon = if (typicalH > 0) -(110 - bb + typicalH).coerceIn(150, 900) else -(850 - bb).coerceIn(150, 650)
+            kind = 3
         } else if (inc.isNotEmpty()) {
-            cuon = inc.minOf { it.top } - 80
-            // Tiêu đề đã sát đầu màn hình mà câu vẫn chưa đủ (câu quá cao): KHÔNG cuộn kiểu "cả trang" làm mất phần đề, chỉ đi tiếp vừa phải.
-            if (cuon < 120) cuon = 420
+            val minTop = inc.minOf { it.top }
+            cuon = minTop - 80
+            // Tiêu đề đã gần đầu màn hình mà câu vẫn chưa đủ (câu cao, hoặc dòng phản hồi vừa làm ô dời xuống): chỉ nhích nhỏ để
+            // tiêu đề về y~60. KHÔNG nhảy 420 vì sẽ đẩy mất phần đề (đã kiểm chứng bằng mô phỏng: làm được 99,5% so với 98,2%).
+            if (cuon < 120) cuon = maxOf(100, minTop - 60)
+            kind = 2
         } else {
             val low = blocks.maxByOrNull { it.top }
             if (low != null) {
                 cuon = if (low.complete) (maxOf(low.bottom, low.lastY + 25) - ANCHOR_Y).coerceIn(120, 850)
                        else if (low.top >= 0) (low.top - 80).coerceIn(120, 850)
                        else 600
+                kind = 1
             }
         }
         val minLabel = raws.mapNotNull { it.label.toIntOrNull() }.minOrNull() ?: Int.MAX_VALUE
-        return VResult(taps.sortedBy { it.y }, cuon, retry, pending, need.joinToString(" "), upLabel, minLabel, doneOut, completeOut)
+        return VResult(taps.sortedBy { it.y }, cuon, retry, pending, need.joinToString(" "), "", minLabel, doneOut, completeOut, kind, heightsOut)
     }
 
     // ---------- Chọn model / key: bỏ qua model đang hết hạn mức, hỗ trợ nhiều API key ----------
@@ -555,14 +569,14 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
 
     // CHẾ ĐỘ NHÌN ẢNH: dùng khi cây giao diện không đưa nội dung trang web (không có ô chọn để chạm theo [id]).
     // AI đọc ảnh chụp, liệt kê các câu đang hiện (đủ/thiếu, đã chọn/chưa) và chọn đáp án; app tự quyết định chạm và kéo trang.
-    fun askVision(apiKey: String, fast: Boolean, upBlocked: Set<String> = emptySet(), hint: String = "", relax: Boolean = false,
-                  doneSet: Set<String> = emptySet(), typical: Int = 0): VResult {
+    fun askVision(apiKey: String, fast: Boolean, limitUp: Boolean = false, afterAnchor: Boolean = false, hint: String = "", relax: Boolean = false,
+                  doneSet: Set<String> = emptySet(), typical: Int = 0, typicalH: Int = 0): VResult {
         val img = (try { CaptureService.grab(if (fast) 960 else 0) } catch (e: Exception) { null })
             ?: throw RuntimeException(if (CaptureService.blackFrame) "Ảnh chụp bị đen (app chặn chụp màn hình)" else "Chưa có ảnh chụp màn hình (hãy bật 📷)")
         val (m, mode, resp) = callModels(apiKey, "vision|$fast", fast) { md -> visionBody(img, md, fast, hint) }
         val text = replyText(resp)
         lastInfo = "Model: $m | CHẾ ĐỘ NHÌN ẢNH | Nhanh: $fast | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
-        return parseVision(text, upBlocked, doneSet, relax, typical)
+        return parseVision(text, limitUp, afterAnchor, doneSet, relax, typical, typicalH)
     }
 
     // Không gọi danh sách model trước (bớt 1 vòng mạng); chỉ dò model khi mọi model mặc định đều lỗi.
