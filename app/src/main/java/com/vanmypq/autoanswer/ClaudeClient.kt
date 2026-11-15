@@ -19,6 +19,7 @@ object ClaudeClient {
 
     @Volatile var lastInfo: String = ""
     @Volatile var lastSwitch: String = ""
+    @Volatile var lastRings: String = ""
 
     // Một điểm cần chạm do AI chỉ ra trên ẢNH CHỤP: x, y chuẩn hoá 0..1000 (x từ trái sang, y từ trên xuống).
     data class VTap(val x: Int, val y: Int, val label: String)
@@ -330,7 +331,8 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
     // afterAnchor: lần cuộn trước là neo theo đáp án cuối -> câu bị cắt đầu ở mép trên (không có nhãn số) chính là câu vừa làm.
     // Câu CÓ nhãn số thì dùng bộ nhớ nhãn (doneSet) để biết đã làm hay chưa, nên câu chưa làm vẫn được kéo ngược lên xem.
     // typicalH: chiều cao quen thuộc của một câu (đầu -> phương án cuối), học từ các câu đã hiện đủ; 0 = chưa biết.
-    private fun parseVision(text: String, limitUp: Boolean, afterAnchor: Boolean, doneSet: Set<String>, relax: Boolean, typical: Int, typicalH: Int): VResult {
+    private fun parseVision(text: String, limitUp: Boolean, afterAnchor: Boolean, doneSet: Set<String>, relax: Boolean, typical: Int, typicalH: Int,
+                            rings: List<IntArray>?): VResult {
         class Raw(val label: String, val so: String, val dcModel: Boolean, val top: Int, val bot: Int, val chon: String,
                   val x: Int, val keys: List<String>, val ys: List<Int>)
         class Blk(val label: String, val top: Int, val bottom: Int, val complete: Boolean, val done: Boolean, val lastY: Int)
@@ -369,6 +371,46 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
                 }
             }
         } catch (e: Exception) {
+        }
+        // ---- TOẠ ĐỘ Ô TRÒN THẬT: AI hay đo lệch (có khi cả một dòng: ghi phương án A ở vị trí của B nên chạm nhầm B).
+        // Phát hiện các ô tròn bằng điểm ảnh, gom thành cụm theo câu, rồi thay danh sách toạ độ do AI đo bằng toạ độ thật của cụm tương ứng.
+        // AI chỉ còn việc chọn phương án đúng theo THỨ TỰ (A = ô trên cùng của câu...). Không phát hiện được gì thì giữ nguyên toạ độ AI.
+        class Cl(val x: Int, val ys: List<Int>)
+        val clusters = ArrayList<Cl>()
+        if (rings != null && rings.isNotEmpty()) {
+            var cur = ArrayList<IntArray>()
+            for (rg in rings) {
+                if (cur.isNotEmpty() && rg[1] - cur[cur.size - 1][1] > 260) {
+                    clusters.add(Cl(cur.map { it[0] }.sorted()[cur.size / 2], cur.map { it[1] }))
+                    cur = ArrayList()
+                }
+                cur.add(rg)
+            }
+            if (cur.isNotEmpty()) clusters.add(Cl(cur.map { it[0] }.sorted()[cur.size / 2], cur.map { it[1] }))
+        }
+        lastRings = if (rings == null) "chưa có khung hình" else rings.joinToString(", ") { "${it[0]}‰,${it[1]}‰" }
+        if (clusters.isNotEmpty()) {
+            val used = BooleanArray(clusters.size)
+            for (ri in raws.indices) {
+                val r = raws[ri]
+                val lo = if (r.top < 0) 0 else r.top
+                val hi = if (r.bot >= 1000) 1000 else r.bot
+                var best = -1
+                var bestOv = 0
+                for (ci in clusters.indices) {
+                    if (used[ci]) continue
+                    val cl = clusters[ci]
+                    val ov = minOf(hi + 120, cl.ys[cl.ys.size - 1] + 40) - maxOf(lo - 120, cl.ys[0] - 40)
+                    if (ov > bestOv) { bestOv = ov; best = ci }
+                }
+                if (best >= 0) {
+                    used[best] = true
+                    val cl = clusters[best]
+                    val lastRing = cl.ys[cl.ys.size - 1]
+                    raws[ri] = Raw(r.label, r.so, r.dcModel, r.top, if (lastRing > 960) 1000 else lastRing + 35, r.chon, cl.x,
+                        cl.ys.indices.map { ('A' + it).toString() }, cl.ys)
+                }
+            }
         }
         val taps = ArrayList<VTap>()
         val blocks = ArrayList<Blk>()
@@ -573,10 +615,16 @@ Chỉ liệt kê phần câu hỏi trắc nghiệm; bỏ qua thanh địa chỉ,
                   doneSet: Set<String> = emptySet(), typical: Int = 0, typicalH: Int = 0): VResult {
         val img = (try { CaptureService.grab(if (fast) 960 else 0) } catch (e: Exception) { null })
             ?: throw RuntimeException(if (CaptureService.blackFrame) "Ảnh chụp bị đen (app chặn chụp màn hình)" else "Chưa có ảnh chụp màn hình (hãy bật 📷)")
+        // Phát hiện ô tròn bằng điểm ảnh CHẠY SONG SONG trong lúc chờ AI (không tốn thêm thời gian).
+        val ringTask = java.util.concurrent.FutureTask<List<IntArray>?> { try { CaptureService.detectRings() } catch (e: Exception) { null } }
+        Thread(ringTask).start()
         val (m, mode, resp) = callModels(apiKey, "vision|$fast", fast) { md -> visionBody(img, md, fast, hint) }
         val text = replyText(resp)
         lastInfo = "Model: $m | CHẾ ĐỘ NHÌN ẢNH | Nhanh: $fast | Chế độ suy nghĩ: $mode\n" + lastSwitch + "\nAI trả lời:\n$text"
-        return parseVision(text, limitUp, afterAnchor, doneSet, relax, typical, typicalH)
+        val rings = try { ringTask.get() } catch (e: Exception) { null }
+        val res = parseVision(text, limitUp, afterAnchor, doneSet, relax, typical, typicalH, rings)
+        lastInfo += "\nÔ TRÒN PHÁT HIỆN BẰNG ĐIỂM ẢNH (x‰,y‰ so với chiều rộng/cao màn hình): " + lastRings
+        return res
     }
 
     // Không gọi danh sách model trước (bớt 1 vòng mạng); chỉ dò model khi mọi model mặc định đều lỗi.
