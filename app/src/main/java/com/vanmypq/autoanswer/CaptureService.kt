@@ -164,6 +164,109 @@ class CaptureService : Service() {
             return best
         }
 
+        // Phát hiện các ô tròn (radio) trên khung hình mới nhất BẰNG ĐIỂM ẢNH (không nhờ AI đo toạ độ - AI hay lệch cả một dòng).
+        // Ô tròn = vòng viền xám (hoặc màu nếu đã chọn) đều quanh một tâm, bên trong trắng/màu, bên ngoài trắng.
+        // Trả về danh sách [xu, yu] theo đơn vị 0..1000, từ trên xuống, hoặc null nếu chưa có khung hình.
+        // Đã thử trên nhiều ảnh chụp thật: tìm đúng các ô (cả ô đã chọn xanh/đỏ), không nhầm dấu tích xanh hay chữ.
+        fun detectRings(): List<IntArray>? {
+            if (reader == null) return null
+            return synchronized(lock) {
+                val image = latest ?: return@synchronized null
+                try {
+                    val plane = image.planes[0]
+                    val buf = plane.buffer
+                    val rs = plane.rowStride
+                    val ps = plane.pixelStride
+                    val n = w * h
+                    val lum = ByteArray(n)
+                    val sat = ByteArray(n)
+                    for (y in 0 until h) {
+                        val row = y * rs
+                        val base = y * w
+                        for (x in 0 until w) {
+                            val o = row + x * ps
+                            val r = buf.get(o).toInt() and 0xff
+                            val g = buf.get(o + 1).toInt() and 0xff
+                            val b = buf.get(o + 2).toInt() and 0xff
+                            lum[base + x] = ((r + g + b) / 3).toByte()
+                            sat[base + x] = (maxOf(r, g, b) - minOf(r, g, b)).toByte()
+                        }
+                    }
+                    fun ringPix(x: Int, y: Int): Boolean {
+                        if (x < 0 || y < 0 || x >= w || y >= h) return false
+                        val l = lum[y * w + x].toInt() and 0xff
+                        val sv = sat[y * w + x].toInt() and 0xff
+                        return (sv < 40 && l in 70..215) || (sv >= 50 && l < 235)
+                    }
+                    fun whitePix(x: Int, y: Int): Boolean {
+                        if (x < 0 || y < 0 || x >= w || y >= h) return false
+                        val l = lum[y * w + x].toInt() and 0xff
+                        val sv = sat[y * w + x].toInt() and 0xff
+                        return (l > 228 && sv < 30) || sv >= 50
+                    }
+                    val cs = DoubleArray(24) { Math.cos(2.0 * Math.PI * it / 24.0) }
+                    val sn = DoubleArray(24) { Math.sin(2.0 * Math.PI * it / 24.0) }
+                    val found = ArrayList<IntArray>()
+                    val x0 = (w * 0.03).toInt()
+                    val x1 = (w * 0.20).toInt()
+                    val seen = HashSet<Int>()
+                    for (f in doubleArrayOf(0.021, 0.024, 0.027, 0.030)) {
+                        val rad = maxOf(6, (w * f).toInt())
+                        if (!seen.add(rad)) continue
+                        for (cx in x0..x1) {
+                            if (cx - rad < 0 || cx + rad >= w) continue
+                            for (cy in rad until h - rad) {
+                                if (!(ringPix(cx - rad, cy) && ringPix(cx + rad, cy) && ringPix(cx, cy - rad) && ringPix(cx, cy + rad))) continue
+                                var hits = 0
+                                for (k in 0 until 24) {
+                                    var ok = false
+                                    for (d in -2..2) {
+                                        val xx = Math.round(cx + (rad + d) * cs[k]).toInt()
+                                        val yy = Math.round(cy + (rad + d) * sn[k]).toInt()
+                                        if (ringPix(xx, yy)) { ok = true; break }
+                                    }
+                                    if (ok) hits++
+                                }
+                                if (hits < 21) continue
+                                var inner = if (whitePix(cx, cy)) 1 else 0
+                                for (k in 0 until 8) {
+                                    val xx = Math.round(cx + 0.45 * rad * cs[k * 3]).toInt()
+                                    val yy = Math.round(cy + 0.45 * rad * sn[k * 3]).toInt()
+                                    if (whitePix(xx, yy)) inner++
+                                }
+                                if (inner < 8) continue
+                                var outer = 0
+                                for (k in 0 until 8) {
+                                    val xx = Math.round(cx + 1.45 * rad * cs[k * 3]).toInt()
+                                    val yy = Math.round(cy + 1.45 * rad * sn[k * 3]).toInt()
+                                    if (whitePix(xx, yy)) outer++
+                                }
+                                if (outer < 6) continue
+                                found.add(intArrayOf(cx, cy, rad, hits))
+                            }
+                        }
+                    }
+                    found.sortByDescending { it[3] }
+                    val kept = ArrayList<IntArray>()
+                    for (c in found) {
+                        var close = false
+                        for (k in kept) {
+                            val dx = (c[0] - k[0]).toDouble()
+                            val dy = (c[1] - k[1]).toDouble()
+                            if (Math.sqrt(dx * dx + dy * dy) < 0.9 * maxOf(c[2], k[2])) { close = true; break }
+                        }
+                        if (!close) kept.add(c)
+                    }
+                    if (kept.isEmpty()) return@synchronized ArrayList<IntArray>()
+                    val med = kept.map { it[0] }.sorted()[kept.size / 2]
+                    val col = kept.filter { Math.abs(it[0] - med) <= 0.04 * w }.sortedBy { it[1] }
+                    col.map { intArrayOf(it[0] * 1000 / w, it[1] * 1000 / h) }
+                } catch (e: Exception) {
+                    null
+                }
+            }
+        }
+
         @Volatile private var snapTs = 0L
         @Volatile private var snapCache: IntArray? = null
 
